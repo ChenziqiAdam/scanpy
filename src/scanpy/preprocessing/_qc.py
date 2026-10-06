@@ -13,6 +13,7 @@ from scipy import sparse
 from scanpy.get import _get_arr
 from scanpy.preprocessing._distributed import materialize_as_ndarray
 
+from .. import _scientific_checkers as _sc
 from .._compat import CSBase, CSRBase, DaskArray, warn
 from .._utils import _doc_params, axis_nnz
 from ._docs import (
@@ -401,7 +402,10 @@ def top_segment_proportions(mtx: np.ndarray, ns: Collection[int]) -> np.ndarray:
         acc += partitioned[:, prev:n].sum(axis=1)
         values[:, j] = acc
         prev = n
-    return values / sums[:, None]
+    out = values / sums[:, None]
+    if _sc.enabled():
+        _sc.check_top_segment(mtx, ns, out)
+    return out
 
 
 @top_segment_proportions.register(DaskArray)
@@ -424,7 +428,10 @@ def _(mtx: DaskArray, ns: Collection[int]) -> DaskArray:
 def _(mtx: CSBase | sparse.coo_matrix, ns: Collection[int]) -> DaskArray:
     if not isinstance(mtx, CSRBase):
         mtx = mtx.tocsr()
-    return top_segment_proportions_sparse_csr(mtx.data, mtx.indptr, np.array(ns))
+    out = top_segment_proportions_sparse_csr(mtx.data, mtx.indptr, np.array(ns))
+    if _sc.enabled():
+        _sc.check_top_segment(mtx, ns, out)
+    return out
 
 
 @njit

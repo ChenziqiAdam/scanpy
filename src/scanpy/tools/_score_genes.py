@@ -9,6 +9,7 @@ import numpy as np
 import pandas as pd
 from fast_array_utils.numba import njit
 
+from .. import _scientific_checkers as _sc
 from .. import logging as logg
 from .._compat import CSBase
 from .._docs import doc_rng
@@ -164,10 +165,12 @@ def score_genes(  # noqa: PLR0913
     start = logg.info(f"computing score {score_name!r}")
     rng = np.random.default_rng(rng)
     rng = _if_legacy_apply_global(rng)
+    _rng0 = _sc.copy_rng(rng) if _sc.enabled() else None
     adata = adata.copy() if copy else adata
     if isinstance(ctrl_as_ref, Default):
         ctrl_as_ref = settings.preset.score_genes.ctrl_as_ref
     use_raw = check_use_raw(adata, use_raw, layer=layer)
+    _raw_arg, _layer_arg = use_raw, layer
     if is_backed_type(adata.X) and not use_raw:
         msg = f"score_genes is not implemented for matrices of type {type(adata.X)}"
         raise NotImplementedError(msg)
@@ -199,6 +202,8 @@ def score_genes(  # noqa: PLR0913
             msg += " Try setting `ctrl_as_ref=False`."
         raise RuntimeError(msg)
 
+    if _sc.enabled():
+        _sc.check_control_genes(control_genes, gene_list, gene_pool)
     means_list, means_control = (
         _nan_means(get_subset(genes), axis=1, dtype="float64")
         for genes in (gene_list, control_genes)
@@ -218,6 +223,19 @@ def score_genes(  # noqa: PLR0913
             f"    {len(control_genes)} total control genes are used."
         ),
     )
+    if _sc.enabled():
+        _sc.check_score_genes(
+            adata,
+            gene_list,
+            _rng0,
+            ctrl_as_ref=ctrl_as_ref,
+            ctrl_size=ctrl_size,
+            gene_pool=gene_pool,
+            n_bins=n_bins,
+            score_name=score_name,
+            use_raw=_raw_arg,
+            layer=_layer_arg,
+        )
     return adata if copy else None
 
 

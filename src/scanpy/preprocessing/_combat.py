@@ -6,6 +6,7 @@ import numpy as np
 import pandas as pd
 from numpy import linalg as la
 
+from .. import _scientific_checkers as _sc
 from .. import logging as logg
 from .._compat import CSBase
 from .._utils import sanitize_anndata
@@ -283,6 +284,8 @@ def combat(  # noqa: PLR0915
 
     # put back into the adata object or return
     x = bayesdata.to_numpy().transpose()
+    if _sc.enabled():
+        _sc.check_combat(adata, data, x, key, covariates)
     if inplace:
         adata.X = x
         return None

@@ -12,6 +12,7 @@ import pandas as pd
 from anndata import AnnData
 from fast_array_utils import stats
 
+from .. import _scientific_checkers as _sc
 from .. import logging as logg
 from .._compat import CSBase, CSRBase, DaskArray, warn
 from .._settings import Default, Verbosity, settings
@@ -279,6 +280,8 @@ def _highly_variable_genes_seurat_v3(  # noqa: PLR0912, PLR0915
     )
     df["highly_variable"] = False
     df.loc[sorted_index[: int(n_top_genes)], "highly_variable"] = True
+    if _sc.enabled():
+        _sc.check_hvg_v3_selection(df, flavor, n_top_genes)
 
     if inplace:
         adata.uns["hvg"] = {"flavor": flavor}
@@ -429,6 +432,8 @@ def _highly_variable_genes_single_batch(
 
     # actually do the normalization
     df["dispersions_norm"] = (df["dispersions"] - disp_stats["avg"]) / disp_stats["dev"]
+    if _sc.enabled() and not isinstance(df["dispersions"], DaskArray):
+        _sc.check_hvg_binned(df, flavor)
     df["highly_variable"] = _subset_genes(
         adata[:, filt],
         mean=mean,
@@ -820,6 +825,17 @@ def highly_variable_genes(  # noqa: PLR0913
 
     logg.info("    finished", time=start)
 
+    if _sc.enabled():
+        _sc.check_hvg_selection(
+            adata,
+            df,
+            batch_key=batch_key,
+            layer=layer,
+            cutoff=cutoff,
+            n_bins=n_bins,
+            flavor=flavor,
+            filter_unexpressed_genes=filter_unexpressed_genes,
+        )
     if not inplace:
         if subset:
             df = df.loc[df["highly_variable"]]

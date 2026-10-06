@@ -22,6 +22,7 @@ from numpy._typing._array_like import NDArray
 from pandas.api.types import CategoricalDtype
 from sklearn.utils import check_array
 
+from .. import _scientific_checkers as _sc
 from .. import logging as logg
 from .._compat import CSBase, CSRBase, DaskArray
 from .._docs import doc_ref_compat, doc_rng
@@ -562,6 +563,7 @@ def regress_out(
 
     x = _get_arr(adata, layer=layer)
     raise_not_implemented_error_if_backed_type(x, "regress_out")
+    _snap = _sc.snap_array(x) if _sc.enabled() else None
 
     if isinstance(x, CSBase):
         logg.info("    sparse input is densified and may lead to high memory use")
@@ -641,6 +643,8 @@ def regress_out(
         # The transpose is needed to get the matrix in the shape needed
         res = np.vstack(res).T
 
+    if _snap is not None:
+        _sc.check_regress_out(_snap, res, regressors, variable_is_categorical)
     _set_obs_rep(adata, res, layer=layer)
     logg.info("    finished", time=start)
     return adata if copy else None
@@ -883,6 +887,7 @@ def downsample_counts(
         raise ValueError(msg)
     if copy:
         adata = adata.copy()
+    _snap = _sc.snap_array(adata.X) if _sc.enabled() else None
     if total_counts is not None:
         adata.X = _downsample_total_counts(
             adata.X, total_counts, rng=rng, replace=replace
@@ -890,6 +895,14 @@ def downsample_counts(
     elif counts_per_cell is not None:
         adata.X = _downsample_per_cell(
             adata.X, counts_per_cell, rng=rng, replace=replace
+        )
+    if _snap is not None:
+        _sc.check_downsample(
+            _snap,
+            adata.X,
+            total_counts=total_counts,
+            counts_per_cell=counts_per_cell,
+            replace=replace,
         )
     return adata if copy else None
 

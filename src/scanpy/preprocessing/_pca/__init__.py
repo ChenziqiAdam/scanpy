@@ -6,6 +6,7 @@ import numpy as np
 from anndata import AnnData
 from scverse_misc import Deprecation, deprecated_arg
 
+from ... import _scientific_checkers as _sc
 from ... import logging as logg
 from ..._compat import CSBase, DaskArray, warn
 from ..._docs import doc_rng
@@ -334,6 +335,8 @@ def pca(  # noqa: PLR0912, PLR0913, PLR0915
         )
         x_pca = pca_.fit_transform(x)
 
+    if _sc.enabled():
+        _sc.check_pca(x, x_pca, pca_, zero_center, svd_solver, chunked)
     if x_pca.dtype.descr != np.dtype(dtype).descr:
         x_pca = x_pca.astype(dtype)
 

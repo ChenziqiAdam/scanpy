@@ -13,6 +13,7 @@ from scipy import sparse
 from scverse_misc import Deprecation, deprecated_arg
 
 from .. import _utils
+from .. import _scientific_checkers as _sc
 from .. import logging as logg
 from .._compat import CSBase, DaskArray, warn
 from .._docs import doc_mask
@@ -341,6 +342,8 @@ class _RankGenes:
         )
         if self.ireference is None:
             self._stats_vs_rest(x, need_var=need_var)
+            if _sc.enabled():
+                _sc.check_rest_stats(self, x)
         else:
             self._stats_vs_reference(x, need_var=need_var)
 
@@ -1033,6 +1036,20 @@ def rank_genes_groups(  # noqa: PLR0912, PLR0913, PLR0915
             )
         ),
     )
+    if _sc.enabled():
+        _sc.check_rank_genes_groups(
+            adata,
+            key_added,
+            groupby,
+            reference=reference,
+            method=method,
+            use_raw=use_raw,
+            layer=layer,
+            mask_var=mask_var,
+            corr_method=corr_method,
+            tie_correct=tie_correct,
+            mean_in_log_space=mean_in_log_space,
+        )
     return adata if copy else None
 
 

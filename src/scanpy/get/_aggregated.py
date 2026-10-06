@@ -12,6 +12,7 @@ from fast_array_utils.numba import njit
 from scipy import sparse
 from sklearn.utils.sparsefuncs import csc_median_axis_0
 
+from .. import _scientific_checkers as _sc
 from .._compat import CSBase, CSRBase, DaskArray, warn
 from .._docs import doc_ref_compat
 from .._settings import Preset, settings
@@ -695,6 +696,8 @@ def aggregate_array(
     if "median" in funcs:
         agg = groupby.median()
         result["median"] = agg
+    if _sc.enabled():
+        _sc.check_aggregate(data, by, mask, result, dof)
     return result
 
 

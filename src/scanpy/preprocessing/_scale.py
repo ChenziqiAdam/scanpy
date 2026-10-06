@@ -11,6 +11,7 @@ from fast_array_utils.numba import njit
 from fast_array_utils.stats import mean_var
 from scverse_misc import Deprecation, deprecated_arg
 
+from .. import _scientific_checkers as _sc
 from .. import logging as logg
 from .._compat import CSBase, CSCBase, CSRBase, DaskArray, warn
 from .._docs import doc_mask
@@ -207,6 +208,7 @@ def scale_array[A: _Array](
         )
         x = x.astype(np.float64)
 
+    _snap = _sc.snap_array(x) if _sc.enabled() else None
     mask = _mask_arg(mask, mask_obs, dim="obs")
     mask = (
         # For CSR matrices, default to a set mask to take the `scale_array_masked` path.
@@ -216,13 +218,22 @@ def scale_array[A: _Array](
         else _check_mask(x, mask, "obs")
     )
     if mask is not None:
-        return scale_array_masked(
+        result = scale_array_masked(
             x,
             mask,
             zero_center=zero_center,
             max_value=max_value,
             return_mean_std=return_mean_std,
         )
+        if _snap is not None:
+            _sc.check_scale(
+                _snap,
+                result[0] if return_mean_std else result,
+                zero_center=zero_center,
+                max_value=max_value,
+                mask=mask,
+            )
+        return result
 
     mean, var = mean_var(x, axis=0, correction=1)
     std = np.sqrt(var)
@@ -247,6 +258,10 @@ def scale_array[A: _Array](
     # do the clipping
     if max_value is not None:
         x = clip(x, max_value=max_value, zero_center=zero_center)
+    if _snap is not None:
+        _sc.check_scale(
+            _snap, x, zero_center=zero_center, max_value=max_value, mask=None
+        )
     if return_mean_std:
         return x, mean, std
     else:

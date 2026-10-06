@@ -17,6 +17,7 @@ from packaging.version import Version
 from scipy import sparse
 
 from .. import _utils
+from .. import _scientific_checkers as _sc
 from .. import logging as logg
 from .._compat import CSBase, CSRBase, SpBase, pkg_version, warn
 from .._docs import doc_rng
@@ -243,6 +244,8 @@ def neighbors(  # noqa: PLR0913
         neighbors_.knn = True
         neighbors_._distances = distances
         neighbors_._connectivities = neighbors_._compute_connectivites(method)
+        if _sc.enabled():
+            _sc.check_connectivities(neighbors_._connectivities, method, neighbors_._distances)
 
     key_added, neighbors_dict = _get_metadata(
         key_added,
@@ -614,6 +617,8 @@ class Neighbors:
             if method is None
             else self._compute_connectivites(method, (knn_indices, knn_distances))
         )
+        if _sc.enabled():
+            _sc.check_connectivities(self._connectivities, method, self._distances)
         self._number_connected_components = 1
         if isinstance(self._connectivities, CSBase):
             from scipy.sparse.csgraph import connected_components

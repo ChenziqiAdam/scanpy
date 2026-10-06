@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, ClassVar, overload
 import numpy as np
 import pandas as pd
 
+from .. import _scientific_checkers as _sc
 from .._compat import CSRBase, DaskArray, SpBase, fullname, warn
 from .._utils import NeighborsView
 
@@ -48,6 +49,12 @@ class _SparseMetric(ABC):
         """Calculate metric when ``._vals`` is a 1D vector."""
 
     def __call__(self) -> np.ndarray:
+        result = self._call()
+        if _sc.enabled():
+            _sc.check_autocorr(self, result)
+        return result
+
+    def _call(self) -> np.ndarray:
         match self._vals, self._vals.ndim:
             case _, 2 if isinstance(self._vals, CSRBase | np.ndarray):
                 assert self.graph.shape[0] == self._vals.shape[1]

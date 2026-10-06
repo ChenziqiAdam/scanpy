@@ -8,6 +8,7 @@ import numpy as np
 from fast_array_utils import stats
 from fast_array_utils.numba import njit
 
+from .. import _scientific_checkers as _sc
 from .. import logging as logg
 from .._compat import CSBase, CSCBase, CSRBase, DaskArray, warn
 from .._utils import axis_mul_or_truediv, dematrix, view_to_actual
@@ -264,12 +265,23 @@ def normalize_total(  # noqa: PLR0912
 
     start = logg.info("normalizing counts per cell")
 
+    if _sc.enabled():
+        _snap = _sc.snap_array(x)
     x, counts_per_cell, gene_subset = _normalize_total_helper(
         x,
         exclude_highly_expressed=exclude_highly_expressed,
         max_fraction=max_fraction,
         target_sum=target_sum,
     )
+    if _sc.enabled():
+        _sc.check_normalize_total(
+            _snap,
+            x,
+            counts_per_cell,
+            target_sum=target_sum,
+            exclude=exclude_highly_expressed,
+            max_fraction=max_fraction,
+        )
 
     if exclude_highly_expressed:
         logg.info(
