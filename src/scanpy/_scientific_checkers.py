@@ -107,6 +107,13 @@ def _is_sparse(x):
     return sparse.issparse(x)
 
 
+def _dtype_kind(x):
+    try:
+        return np.dtype(getattr(x, "dtype", np.float64)).kind
+    except Exception:
+        return "f"
+
+
 def _eps_of(x):
     try:
         dt = np.dtype(getattr(x, "dtype", np.float64))
@@ -331,21 +338,28 @@ def check_scale(snap, out, *, zero_center, max_value, mask):
     if max_value is not None:
         un = run(snap.copy(), None, None if mask is None else np.asarray(mask, dtype=bool))
         u = _dense64(un)[rows]
+        cols = np.isfinite(u).all(axis=0) & np.isfinite(a_out).all(axis=0)  # constant genes give 0/0
+        u, a_chk = u[:, cols], a_out[:, cols]
         exp = np.minimum(u, float(max_value))
         if zero_center:
             exp = np.maximum(exp, -float(max_value))
-        d = float(np.max(np.abs(exp - a_out)))
-        trigger_if(_violates(d, _C * eps * max(1.0, float(np.max(np.abs(u))))), "SC-SCL-002")
+        if u.size:
+            d = float(np.max(np.abs(exp - a_chk)))
+            trigger_if(_violates(d, _C * eps * max(1.0, float(np.max(np.abs(u))))), "SC-SCL-002")
     # SC-SCL-003: mask locality
     if mask is not None and not rows.all():
         full_in = _dense64(snap)
         full_out = _dense64(out)
         outside = full_in[~rows]
         changed = not np.array_equal(full_out[~rows], outside, equal_nan=True)
-        sub = snap[rows] if not _is_sparse(snap) else snap.tocsr()[rows]
+        sub = snap[rows]  # same container as the call under test (csc and csr accumulate differently)
         s = _dense64(run(sub.copy(), max_value, None))
-        d = float(np.max(np.abs(s - a_out))) if s.size else 0.0
-        trigger_if(changed or _violates(d, _C * eps * max(1.0, float(np.max(np.abs(s))) if s.size else 1.0)), "SC-SCL-003")
+        # a numerically constant gene has a rounding-noise std, so its scaled values are ill-conditioned
+        well = std_in > 1e-6 * np.abs(mean_in)
+        d = float(np.max(np.abs(s[:, well] - a_out[:, well]))) if s.size and well.any() else 0.0
+        # the one-pass variance of either computation carries error ~ eps * (1 + mean^2/var)
+        kappa = float(np.max((1.0 + (mean_in[well] / std_in[well]) ** 2) * _log2(n))) if well.any() else 1.0
+        trigger_if(changed or _violates(d, _C * eps * kappa * max(1.0, float(np.max(np.abs(s[:, well]))) if s.size and well.any() else 1.0)), "SC-SCL-003")
 
 
 # ================================================== C. downsampling
@@ -687,6 +701,9 @@ def check_rank_genes_groups(adata, key, groupby, *, reference, method, use_raw, 
     have_lfc = "logfoldchanges" in res
     sizes = obs.value_counts()
     bad = dict.fromkeys(("001", "002", "003", "004", "005"), False)
+    _xs = _dense64(x)
+    # p-values are functions of statistics built from one-pass moments: error grows with 1 + mean^2/var
+    kappa_p = 1.0 + float(np.max(_xs.mean(axis=0) ** 2 / np.maximum(_xs.var(axis=0, ddof=1), 1e-300))) if _xs.shape[0] > 1 else 1.0
 
     def gap(a, b, tol_extra=0.0):
         return np.abs(a - b) > 0
@@ -704,7 +721,7 @@ def check_rank_genes_groups(adata, key, groupby, *, reference, method, use_raw, 
             for nm, s in s1.items():
                 if nm in s2 and np.isfinite(s) and np.isfinite(s2[nm]):
                     bad["001"] |= _violates(abs(s + s2[nm]), _C * eps32 * (1.0 + abs(s)))
-                    pt = _C * _EPS * N * (1.0 + abs(s))
+                    pt = _C * _EPS * N * kappa_p * (1.0 + abs(s))
                     bad["001"] |= _violates(abs(p1[nm] - p2[nm]), pt)
             if have_lfc and "logfoldchanges" in r2:
                 l1, l2 = _res_by_name(res, "logfoldchanges", g), _res_by_name(r2, "logfoldchanges", reference)
@@ -768,7 +785,8 @@ def check_rank_genes_groups(adata, key, groupby, *, reference, method, use_raw, 
                     bad["004"] |= True
     # SC-DE-005: negating the data negates the statistic (t statistics are computed on expm1 of the
     # data when mean_in_log_space=False, which is not odd, so only wilcoxon is in the domain there)
-    if method == "wilcoxon" or (method == "t-test" and mean_in_log_space):
+    # (negating unsigned integers wraps around, so those inputs are outside the law's domain)
+    if _dtype_kind(x) != "u" and (method == "wilcoxon" or (method == "t-test" and mean_in_log_space)):
         neg = _slim(adata, groupby, x, names, negate=True)
         for g in groups:
             ref_g = reference
@@ -782,7 +800,7 @@ def check_rank_genes_groups(adata, key, groupby, *, reference, method, use_raw, 
             for nm, s in s1.items():
                 if nm in s2 and np.isfinite(s) and np.isfinite(s2[nm]):
                     bad["005"] |= _violates(abs(s + s2[nm]), _C * eps32 * (1.0 + abs(s)))
-                    bad["005"] |= _violates(abs(p1[nm] - p2[nm]), _C * _EPS * N * (1.0 + abs(s)))
+                    bad["005"] |= _violates(abs(p1[nm] - p2[nm]), _C * _EPS * N * kappa_p * (1.0 + abs(s)))
     trigger_if(bad["001"], "SC-DE-001")
     trigger_if(bad["002"], "SC-DE-002")
     trigger_if(bad["003"], "SC-DE-003")
@@ -812,6 +830,8 @@ def check_rest_stats(rg, x):
         if n_rest < 2:
             continue
         xr = x[rest]
+        if xr.dtype.kind in "iub":  # integer accumulators would wrap in the reference computation
+            xr = xr.astype(np.float64)
         m, v = stats.mean_var(xr, axis=0, correction=1)
         m, v = np.asarray(m, dtype=np.float64), np.asarray(v, dtype=np.float64)
         scale = sum(sel_counts[h] * mean_abs[h] for h in range(k)) / n_rest + np.abs(m)
@@ -985,7 +1005,8 @@ def check_combat(adata, data, corrected, key, covariates):
         xc0 = xo - xo.mean(axis=0)
         yc0 = xc - xc.mean(axis=0)
         sxx = (xc0**2).sum(axis=0)
-        ok = sxx > 0
+        ok = sxx > len(idx) * (1e-9 * np.abs(xo.mean(axis=0))) ** 2
+        ok &= sxx > 0
         if not ok.any():
             continue
         slope = (xc0[:, ok] * yc0[:, ok]).sum(axis=0) / sxx[ok]
