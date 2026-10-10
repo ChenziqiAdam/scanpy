@@ -160,6 +160,32 @@ def _row_sums(x):
     return np.asarray(x, dtype=np.float64).sum(axis=1)
 
 
+def _has_duplicates(x):
+    """True for a CSR/CSC matrix that stores the same (row, column) position more than once.
+
+    Such a matrix is not a well-formed array: scipy sums the duplicates, scanpy kernels read the
+    stored entries one by one, so the two disagree by construction.
+    """
+    try:
+        if _is_sparse(x) and x.format in {"csr", "csc"} and not x.has_canonical_format:
+            y = x.copy()
+            y.sum_duplicates()
+            return y.nnz < x.nnz
+    except Exception:
+        _swallowed()
+    return False
+
+
+def _range_limit(dtype):
+    """Largest magnitude a sum may reach before dtype overflow, with a factor-2 headroom."""
+    dt = np.dtype(dtype)
+    if dt.kind == "f":
+        return 0.5 * float(np.finfo(dt).max)
+    if dt.kind in "iu":
+        return 0.5 * float(np.iinfo(dt).max)
+    return 0.5 * float(np.finfo(np.float64).max)
+
+
 def _log2(n):
     return math.log2(max(int(n), 1) + 2)
 
@@ -228,7 +254,20 @@ def check_normalize_total(snap, out, factors, *, target_sum, exclude, max_fracti
     nonzero = tot > 0
     if not nonzero.any():
         return
+    if _has_duplicates(snap):  # not a well-formed matrix: stored entries and their scipy sum differ
+        return
     log_n = _log2(n_vars)
+    # size factors (usable total / target) must be normal floats of the output dtype; a subnormal or
+    # zero factor makes the division itself lose the scale (the documented law is undefined there)
+    _high0, _ = _highly_expressed(snap, max_fraction, tot) if exclude else (np.zeros(n_vars, dtype=bool), None)
+    _use = _row_sums(snap[:, ~_high0]) if exclude and (~_high0).any() else tot
+    _pos = _use[_use > 0]
+    if _pos.size:
+        _tgt = float(target_sum) if target_sum is not None else float(np.median(_pos))
+        _fi = np.finfo(out.dtype) if np.dtype(out.dtype).kind == "f" else np.finfo(np.float64)
+        _fac = _pos / _tgt if _tgt > 0 else _pos
+        if _tgt <= 0 or float(_fac.min()) < float(_fi.tiny) / _EPS or float(_fac.max()) > float(_fi.max) * _EPS:
+            return
     if not exclude:
         target = float(target_sum) if target_sum is not None else float(np.median(tot[nonzero]))
         sums = _row_sums(out)[nonzero]
@@ -309,6 +348,8 @@ def check_scale(snap, out, *, zero_center, max_value, mask):
         return
     if _size(snap) > _MAX_ELEMS or not _all_finite(snap) or not _all_finite(out):
         return
+    if _has_duplicates(snap):
+        return
     zero_center = bool(zero_center)
     n_obs = snap.shape[0]
     rows = np.ones(n_obs, dtype=bool) if mask is None else np.asarray(mask, dtype=bool)
@@ -385,6 +426,12 @@ def check_downsample(snap, out, *, total_counts, counts_per_cell, replace):
         exp = np.minimum(a.sum(axis=1), t.astype(np.float64))
         bad_total = bool(np.any(b.sum(axis=1) != exp))
     trigger_if(bad_total, "SC-DSM-001")
+    if snap.dtype.kind in "iu" and replace:
+        # with replacement one gene may receive every read of the cell: a target above the dtype
+        # maximum wraps around (compact integer dtype), which is outside the invariant's domain
+        top = float(np.max(exp)) if np.ndim(exp) else float(exp)
+        if top > float(np.iinfo(snap.dtype).max):
+            return
     bad = (not np.array_equal(b, np.round(b))) or bool(np.any(b < 0)) or bool(np.any((a == 0) & (b != 0)))
     if not replace:
         bad = bad or bool(np.any(b > a))
@@ -557,8 +604,11 @@ def check_top_segment(mtx, ns, out):
         return
     n_obs, n_vars = mtx.shape
     ns_s = np.sort(np.asarray(ns, dtype=np.int64))
-    rows = _row_sums(mtx) > 0
+    rs = _row_sums(mtx)
+    rows = rs > 0
     if not rows.any() or out.shape != (n_obs, len(ns_s)):
+        return
+    if _has_duplicates(mtx) or float(rs.max()) > _range_limit(mtx.dtype):  # total not representable
         return
     eps = _eps_of(mtx)
     tol = _C * eps * (math.sqrt(n_vars) + _log2(n_vars))
@@ -593,6 +643,8 @@ def check_autocorr(metric, result):
     if not (isinstance(vals, np.ndarray) or _is_sparse(vals)):
         return
     if not (_all_finite(graph) and _min_value(graph) >= 0 and _all_finite(vals)):
+        return
+    if _has_duplicates(graph) or _has_duplicates(vals):
         return
     n = graph.shape[0]
     if n < 3 or n * (vals.shape[0] if vals.ndim == 2 else 1) > _MAX_ELEMS:
@@ -703,7 +755,7 @@ def check_rank_genes_groups(adata, key, groupby, *, reference, method, use_raw, 
         return
     res = adata.uns[key]
     x, names = _de_matrix(adata, use_raw, layer, mask_var)
-    if not (isinstance(x, np.ndarray) or _is_sparse(x)) or _size(x) > _MAX_ELEMS:
+    if not (isinstance(x, np.ndarray) or _is_sparse(x)) or _size(x) > _MAX_ELEMS or _has_duplicates(x):
         return
     obs = adata.obs[groupby].astype("category")
     cats = {str(c): c for c in obs.cat.categories}
@@ -829,7 +881,7 @@ def check_rest_stats(rg, x):
     """SC-DE-006 (``x`` is the matrix the statistics were computed on)."""
     from fast_array_utils import stats
 
-    if not (isinstance(x, np.ndarray) or _is_sparse(x)) or _size(x) > _MAX_ELEMS:
+    if not (isinstance(x, np.ndarray) or _is_sparse(x)) or _size(x) > _MAX_ELEMS or _has_duplicates(x):
         return
     masks = np.asarray(rg.groups_masks_obs, dtype=bool)
     k = masks.shape[0]
@@ -896,6 +948,9 @@ def check_score_genes(adata, gene_list, rng0, *, ctrl_as_ref, ctrl_size, gene_po
     glist = list(gene_list)
     scale = max(_max_abs(x), 1e-300)
     eps = _eps_of(x)
+    # gene means sum n_vars values: past the dtype range the score itself is inf/NaN
+    if not np.all(np.isfinite(prod)) or scale * len(names) >= _range_limit(x.dtype):
+        return
     # SC-SG-001: order invariance (production dtype)
     rev = run(x.copy(), glist[::-1])
     tol = _C * max(eps, _EPS) * scale * _log2(len(names))
@@ -912,8 +967,12 @@ def check_score_genes(adata, gene_list, rng0, *, ctrl_as_ref, ctrl_size, gene_po
     near = np.diff(mu[order]) <= 1e3 * _EPS * (shift + scale)
     if np.any(near & (cid[order][1:] != cid[order][:-1])):
         return
+    if (scale + shift) * len(names) >= _range_limit(np.float64):  # shifted copy leaves the dtype range
+        return
     base = run(xd, glist)
     moved = run(xd + shift, glist)
+    if not (np.all(np.isfinite(base)) and np.all(np.isfinite(moved))):
+        return
     trigger_if(_violates(float(np.max(np.abs(moved - base))), _C * _EPS * (scale + shift) * _log2(len(names))), "SC-SG-002")
 
 
@@ -965,6 +1024,8 @@ def check_aggregate(data, by, mask, result, dof):
     if dof != 1 or "mean" not in result or "var" not in result:
         return
     if not (isinstance(data, np.ndarray) or _is_sparse(data)) or not _all_finite(data):
+        return
+    if _has_duplicates(data):
         return
     codes = np.asarray(by.codes)
     keep = codes >= 0
@@ -1073,6 +1134,9 @@ def check_pca(x, x_pca, pca_, zero_center, svd_solver, chunked):
     m, vv = np.asarray(m, dtype=np.float64), np.asarray(vv, dtype=np.float64)
     total = float(vv.sum())
     if not total > 0:
+        return
+    # variances past the dtype range (inf) make every ratio inf/inf: outside the law's domain
+    if not (np.isfinite(total) and np.all(np.isfinite(ev)) and np.all(np.isfinite(evr)) and np.all(np.isfinite(m))):
         return
     # explicit-covariance solvers inherit the one-pass conditioning 1 + sum(mean^2)/sum(var)
     kappa_tot = 1.0 + float(np.sum(m**2)) / total
