@@ -275,14 +275,16 @@ def check_normalize_total(snap, out, factors, *, target_sum, exclude, max_fracti
         scaled = snap * 2.0 if _is_sparse(snap) else snap * np.asarray(2.0, dtype=snap.dtype)
         if _all_finite(scaled):
             res2, fac2 = run(scaled)
-            d = float(np.max(np.abs(_dense64(res2)[norm_rows] - out64[norm_rows])))
-            # size factors are proportional to depth, so they must double exactly
-            f = float(np.max(np.abs(fac2[norm_rows] - 2.0 * fac_ref[norm_rows])))
-            trigger_if(
-                _violates(d, _C * eps * max(scale, 1e-300))
-                or _violates(f, _C * eps * max(float(np.max(np.abs(2.0 * fac_ref[norm_rows]))), 1e-300)),
-                "SC-NRM-003",
-            )
+            # 2X may overflow (or underflow) the dtype although X is fine: such a leg is outside the law's domain
+            if _all_finite(res2) and np.all(np.isfinite(fac2)) and np.all(np.isfinite(fac_ref)):
+                d = float(np.max(np.abs(_dense64(res2)[norm_rows] - out64[norm_rows])))
+                # size factors are proportional to depth, so they must double exactly
+                f = float(np.max(np.abs(fac2[norm_rows] - 2.0 * fac_ref[norm_rows])))
+                trigger_if(
+                    _violates(d, _C * eps * max(scale, 1e-300))
+                    or _violates(f, _C * eps * max(float(np.max(np.abs(2.0 * fac_ref[norm_rows]))), 1e-300)),
+                    "SC-NRM-003",
+                )
     if border:  # representation legs may decide ambiguous thresholds differently
         return
     alt = to_other_representation(snap)
@@ -417,8 +419,10 @@ def check_regress_out(snap, res, regressors, categorical):
         return
     eps = max(_eps_of(res), _eps_of(snap))
     dn = np.linalg.norm(d, axis=0)
-    yn = np.linalg.norm(y[:, nonconst], axis=0)
-    inner = np.abs(d.T @ r[:, nonconst]) / (dn[:, None] * np.maximum(yn[None, :], 1e-300))
+    # rescale each gene by its max |y| (the law is scale-free) so that norms cannot under/overflow
+    sc_ = np.max(np.abs(y[:, nonconst]), axis=0)
+    yn = np.linalg.norm(y[:, nonconst] / sc_, axis=0)
+    inner = np.abs(d.T @ (r[:, nonconst] / sc_)) / (dn[:, None] * yn[None, :])
     trigger_if(_violates(float(np.max(inner)), _C * eps * cond**2), "SC-RGO-001")
 
 
@@ -436,6 +440,8 @@ def check_hvg_binned(df, flavor):
 
     for c in np.unique(codes[codes >= 0]):
         idx = codes == c
+        if np.any(np.isinf(d[idx])):  # an overflowed dispersion makes the bin's mean/std (and every z) undefined
+            continue
         fin = idx & np.isfinite(d) & np.isfinite(z)
         m = int(fin.sum())
         if m < 2:
@@ -517,7 +523,14 @@ def check_hvg_selection(adata, df, *, batch_key, layer, cutoff, n_bins, flavor, 
             bad |= (not same_nan) or bool(np.any(diff > 0))
         n2 = df2["dispersions_norm"].to_numpy(dtype=np.float64)
         f2 = n2[np.isfinite(n2)]
-        if len(np.unique(f2)) == len(f2):  # no ties: selection must match too
+        # asking for more genes than have a (non-NaN) score is undefined: the batched path pads the
+        # selection with unscorable genes, the unbatched path returns only the scored ones
+        over_asked = (
+            isinstance(cutoff, (int, np.integer))
+            and not isinstance(cutoff, bool)
+            and int(cutoff) > int((~np.isnan(n2)).sum())
+        )
+        if len(np.unique(f2)) == len(f2) and not over_asked:  # no ties: selection must match too
             bad |= not np.array_equal(hv, df2["highly_variable"].to_numpy(dtype=bool))
         trigger_if(bad, "SC-HVG-003")
 
@@ -658,7 +671,10 @@ def _slim(adata, groupby, x, names, negate=False):
     if negate:
         xx = -xx
     obs = pd.DataFrame({groupby: adata.obs[groupby].astype("category")}, index=adata.obs_names)
-    return AnnData(X=xx, obs=obs, var=pd.DataFrame(index=names))
+    slim = AnnData(X=xx, obs=obs, var=pd.DataFrame(index=names))
+    if "log1p" in adata.uns:  # the log base decides how log fold changes exponentiate the data
+        slim.uns["log1p"] = dict(adata.uns["log1p"])
+    return slim
 
 
 def _res_by_name(res, field, group):

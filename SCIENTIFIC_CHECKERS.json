@@ -129,7 +129,7 @@
       "id": "SC-HVG-001",
       "invariant": "Within each mean bin the normalised dispersions have mean 0 and sample std (ddof=1) 1.",
       "observation_point": "After dispersions_norm is computed.",
-      "precondition": "Flavor seurat; mean bins holding at least 2 finite dispersions with positive spread.",
+      "precondition": "Flavor seurat; mean bins holding at least 2 finite dispersions with positive spread and no infinite (overflowed) dispersion.",
       "rationale": "Normalised dispersion is defined as a within-bin z-score; deviating bins distort gene ranking.",
       "scientific_quantity": "normalised dispersion (seurat)",
       "source": "src/scanpy/preprocessing/_highly_variable_genes.py",
@@ -148,7 +148,7 @@
       "symbol": "_highly_variable_genes_single_batch"
     },
     {
-      "alarm": "means/dispersions/normalised dispersions differ by more than 64*eps*(1+|v|)*(log2(n_vars)+2), different NaN pattern, or the highly_variable mask differs when no two finite normalised dispersions tie.",
+      "alarm": "means/dispersions/normalised dispersions differ by more than 64*eps*(1+|v|)*(log2(n_vars)+2), different NaN pattern, or the highly_variable mask differs when no two finite normalised dispersions tie and n_top_genes does not exceed the number of scored (non-NaN) genes.",
       "family": "hvg_single_batch_identity",
       "id": "SC-HVG-003",
       "invariant": "The result with that batch_key equals the result with batch_key=None.",
