@@ -189,6 +189,20 @@ def _range_limit(dtype):
 _TINY_N = float(np.finfo(np.float64).tiny) / _EPS  # below this, squares/variances lose precision (subnormal range)
 
 
+def _tiny_n(dtype):
+    """finfo(dtype).tiny/eps for float dtypes (float32: 9.9e-32), else the float64 value."""
+    dt = np.dtype(dtype)
+    if dt.kind == "f":
+        fi = np.finfo(dt)
+        return float(fi.tiny) / float(fi.eps)
+    return _TINY_N
+
+
+def _as_f64(x):
+    """float64 copy for reference statistics (integer/float32 accumulators wrap or underflow)."""
+    return x if x.dtype == np.float64 else x.astype(np.float64)
+
+
 def _row_nnz_max(x):
     """Max stored entries per row of the CSR view: recursive (sequential) sums of k terms err by (k-1)u."""
     try:
@@ -377,6 +391,9 @@ def check_scale(snap, out, *, zero_center, max_value, mask):
     std_in = a_in.std(axis=0, ddof=1)
     # a sum of squares past the float64 range makes the production std inf (outputs 0): outside the law
     ok = (std_in > 0) & np.isfinite(std_in) & (np.max(np.abs(a_in), axis=0) ** 2 * n < _range_limit(np.float64))
+    # statistics are accumulated in the input dtype: squares must stay in that dtype's normal range
+    _dt_in = snap.dtype if snap.dtype.kind == "f" else np.float64
+    ok &= (std_in**2 >= _tiny_n(_dt_in)) & (np.max(np.abs(a_in), axis=0) ** 2 * n < _range_limit(_dt_in))
     # SC-SCL-001 (law needs unclipped output)
     if max_value is None and ok.any():
         # the variance comes from a one-pass sum-of-squares mean_var: error ~ eps*(1 + mean^2/var)
@@ -393,7 +410,7 @@ def check_scale(snap, out, *, zero_center, max_value, mask):
             return scale_array(x, zero_center=zero_center, max_value=mv, copy=False, mask=m)
 
     # SC-SCL-002: clipping is truncation
-    if max_value is not None:
+    if max_value is not None and float(max_value) > 0:  # a non-positive clip bound is outside the law's domain
         un = run(snap.copy(), None, None if mask is None else np.asarray(mask, dtype=bool))
         u = _dense64(un)[rows]
         cols = np.isfinite(u).all(axis=0) & np.isfinite(a_out).all(axis=0)  # constant genes give 0/0
@@ -437,24 +454,33 @@ def check_downsample(snap, out, *, total_counts, counts_per_cell, replace):
         bad_total = float(b.sum()) != exp
         if bad_total and snap.dtype.kind == "f":  # library compares its total in the input dtype
             ulp = float(np.spacing(np.asarray(a.sum(), dtype=snap.dtype)))
-            bad_total = not (0 < a.sum() - int(total_counts) <= ulp and float(b.sum()) == float(a.sum()))
+            # target within one input-dtype ulp of the true total (either side): undecidable in that dtype
+            bad_total = not (abs(a.sum() - int(total_counts)) <= ulp
+                             and float(b.sum()) in (float(a.sum()), float(int(total_counts))))
     else:
         n_obs = a.shape[0]
         t = np.full(n_obs, counts_per_cell) if isinstance(counts_per_cell, (int, np.integer)) else np.asarray(counts_per_cell)
         exp = np.minimum(a.sum(axis=1), t.astype(np.float64))
         rs, bs = a.sum(axis=1), b.sum(axis=1)
         wrong = bs != exp
-        if snap.dtype.kind == "f":  # a total within one input-dtype ulp above the target cannot be told apart
+        if snap.dtype.kind == "f":  # a total within one input-dtype ulp of the target cannot be told apart
             ulp = np.spacing(rs.astype(snap.dtype)).astype(np.float64)
-            wrong &= ~((rs - t > 0) & (rs - t <= ulp) & (bs == rs))
+            wrong &= ~((np.abs(rs - t) <= ulp) & ((bs == rs) | (bs == t)))
         bad_total = bool(np.any(wrong))
-    trigger_if(bad_total, "SC-DSM-001")
+    top = float(np.max(exp)) if np.ndim(exp) else float(exp)
     if snap.dtype.kind in "iu" and replace:
         # with replacement one gene may receive every read of the cell: a target above the dtype
-        # maximum wraps around (compact integer dtype), which is outside the invariant's domain
-        top = float(np.max(exp)) if np.ndim(exp) else float(exp)
+        # maximum wraps around (compact integer dtype), which is outside both invariants' domain
         if top > float(np.iinfo(snap.dtype).max):
             return
+    if snap.dtype.kind == "f":
+        # a single entry that may need to hold more reads than the dtype's consecutive-integer limit
+        # (float32: 2**24) cannot be counted read by read: outside the law's domain
+        lim = 2.0 ** (np.finfo(snap.dtype).nmant + 1)
+        # without replacement an entry is bounded by its input; with replacement by what it received
+        if (float(b.max(initial=0.0)) >= lim) if replace else (float(a.max(initial=0.0)) > lim):
+            return
+    trigger_if(bad_total, "SC-DSM-001")
     bad = (not np.array_equal(b, np.round(b))) or bool(np.any(b < 0)) or bool(np.any((a == 0) & (b != 0)))
     if not replace:
         bad = bad or bool(np.any(b > a))
@@ -582,6 +608,20 @@ def check_hvg_selection(adata, df, *, batch_key, layer, cutoff, n_bins, flavor, 
             )
         df2 = df2.reindex(df.index)  # the batched path may return genes in a different order
         bad = False
+        # (disp - avg)/dev amplifies the rounding of disp and of the bin statistics by (|disp|+|avg|)/dev:
+        # genes whose dispersions agree to ~1e-8 within a bin have a normalised score set by rounding
+        from .preprocessing._highly_variable_genes import _mad
+        _d2 = df2["dispersions"].to_numpy(dtype=np.float64)
+        _grp = df2.groupby("mean_bin", observed=True)["dispersions"]
+        if flavor == "cell_ranger":
+            _avg, _dev = _grp.transform("median"), _grp.transform(_mad)
+        else:
+            _avg, _dev = _grp.transform("mean"), _grp.transform("std")
+        _avg = np.abs(_avg.to_numpy(dtype=np.float64))
+        _dev = np.abs(_dev.to_numpy(dtype=np.float64))
+        with np.errstate(divide="ignore", invalid="ignore"):
+            _cond = np.where(_dev > 0, (np.abs(_d2) + _avg) / _dev, 0.0)
+        _cond = np.nan_to_num(_cond, nan=0.0, posinf=0.0)
         for col in ("means", "dispersions", "dispersions_norm"):
             a = df[col].to_numpy(dtype=np.float64)
             b = df2[col].to_numpy(dtype=np.float64)
@@ -589,7 +629,8 @@ def check_hvg_selection(adata, df, *, batch_key, layer, cutoff, n_bins, flavor, 
                 a, b = np.nan_to_num(a, nan=0.0), np.nan_to_num(b, nan=0.0)
             same_nan = np.array_equal(np.isnan(a), np.isnan(b))
             f = np.isfinite(a) & np.isfinite(b)
-            diff = np.abs(a[f] - b[f]) - _C * _EPS * (1.0 + np.abs(a[f])) * _log2(len(a))
+            amp = (_cond[f] * (2.0 + np.abs(a[f]))) if col == "dispersions_norm" else 0.0
+            diff = np.abs(a[f] - b[f]) - _C * _EPS * (1.0 + np.abs(a[f]) + amp) * _log2(len(a))
             bad |= (not same_nan) or bool(np.any(diff > 0))
         n2 = df2["dispersions_norm"].to_numpy(dtype=np.float64)
         f2 = n2[np.isfinite(n2)]
@@ -600,7 +641,14 @@ def check_hvg_selection(adata, df, *, batch_key, layer, cutoff, n_bins, flavor, 
             and not isinstance(cutoff, bool)
             and int(cutoff) > int((~np.isnan(n2)).sum())
         )
-        if len(np.unique(f2)) == len(f2) and not over_asked:  # no ties: selection must match too
+        near_tie = False
+        if isinstance(cutoff, (int, np.integer)) and not isinstance(cutoff, bool) and 0 < int(cutoff) < f2.size:
+            fin2 = np.isfinite(n2)
+            tol_n = _C * _EPS * (1.0 + np.abs(n2[fin2]) + _cond[fin2] * (2.0 + np.abs(n2[fin2]))) * _log2(len(n2))
+            order = np.argsort(-n2[fin2])
+            k = int(cutoff)
+            near_tie = bool(n2[fin2][order[k - 1]] - n2[fin2][order[k]] <= tol_n[order[k - 1]] + tol_n[order[k]])
+        if len(np.unique(f2)) == len(f2) and not over_asked and not near_tie:  # no (near-)ties: selection must match too
             bad |= not np.array_equal(hv, df2["highly_variable"].to_numpy(dtype=bool))
         trigger_if(bad, "SC-HVG-003")
 
@@ -647,7 +695,7 @@ def check_top_segment(mtx, ns, out):
         o2 = np.asarray(_qc.top_segment_proportions(alt, list(ns_s)), dtype=np.float64)
     trigger_if(_violates(float(np.max(np.abs(o2[rows] - o))), tol), "SC-QC-002")
     with _quiet():
-        tp = np.asarray(_qc.top_proportions(mtx, int(ns_s[-1])), dtype=np.float64)
+        tp = np.asarray(_qc.top_proportions(mtx.astype(np.float64) if mtx.dtype.kind in "iub" else mtx, int(ns_s[-1])), dtype=np.float64)  # -mtx wraps for unsigned
     ref = tp[:, ns_s - 1][rows]
     trigger_if(_violates(float(np.max(np.abs(ref - o))), tol), "SC-QC-003")
 
@@ -712,7 +760,10 @@ def check_autocorr(metric, result):
             base = float(np.atleast_1d(cls(graph, v64)())[0])
             aff = float(np.atleast_1d(cls(graph, a * v64 + b)())[0])
         kap2 = 1.0 + (float(np.max(np.abs(v64))) + b) / std
-        bad2 |= _violates(abs(aff - base), _C * _EPS * kap2 * lg * (1.0 + abs(base)))
+        # worst-case numerator magnitude (Geary: (n-1)*sum w (y_i-y_j)^2; Moran: n*sum w z_i z_j)
+        _wsum = max(1.0, float(abs(graph).sum()))
+        in_range = bool(np.float64(2.0 * (abs(a) * float(np.max(np.abs(v64))) + b)) ** 2 * n * _wsum < _range_limit(np.float64))
+        bad2 |= in_range and _violates(abs(aff - base), _C * _EPS * kap2 * lg * (1.0 + abs(base)))
         # SC-AUT-003: representation consistency
         tol3 = _C * max(_EPS, eps_v) * n * (1.0 + (mean / std) ** 2) * (1.0 + abs(r0))
         with _quiet():
@@ -939,8 +990,7 @@ def check_rest_stats(rg, x):
         if n_rest < 2:
             continue
         xr = x[rest]
-        if xr.dtype.kind in "iub":  # integer accumulators would wrap in the reference computation
-            xr = xr.astype(np.float64)
+        xr = _as_f64(xr)  # integer accumulators wrap, float32 ones underflow/round: reference in float64
         m, v = stats.mean_var(xr, axis=0, correction=1)
         m, v = np.asarray(m, dtype=np.float64), np.asarray(v, dtype=np.float64)
         scale = sum(sel_counts[h] * mean_abs[h] for h in range(k)) / n_rest + np.abs(m)
@@ -1082,8 +1132,7 @@ def check_aggregate(data, by, mask, result, dof):
     var_g = np.asarray(result["var"], dtype=np.float64)
     nonempty = counts > 0
     xk = data[keep] if not _is_sparse(data) else data.tocsr()[keep]
-    if xk.dtype.kind in "iub":  # integer accumulators would wrap in the reference computation
-        xk = xk.astype(np.float64)
+    xk = _as_f64(xk)  # integer accumulators wrap, float32 ones underflow: reference in float64
     m, v = stats.mean_var(xk, axis=0, correction=1)
     m, v = np.asarray(m, dtype=np.float64), np.asarray(v, dtype=np.float64)
     ssw = np.where((counts >= 2)[:, None], (counts[:, None] - 1.0) * np.nan_to_num(var_g), 0.0)[nonempty].sum(axis=0)
@@ -1092,7 +1141,10 @@ def check_aggregate(data, by, mask, result, dof):
     kappa = 1.0 + m**2 / np.maximum(v, 1e-300)
     # the statistics are accumulated in the dtype of the data (float32 data: ~1e-6 relative)
     rel = _C * max(_EPS, _eps_of(data)) * n_tot * kappa
-    judged = (v >= _TINY_N) & (rel < 1.0)  # subnormal-range variances carry only a few bits  # a numerically constant gene makes the identity vacuous
+    _mx = np.asarray(abs(xk).max(axis=0).todense() if _is_sparse(xk) else np.abs(xk).max(axis=0), dtype=np.float64).ravel()
+    # squares past the float64 range (sum of squares overflows in the kernels) are outside the law's domain
+    in_rng = _mx**2 * n_tot < _range_limit(np.float64)
+    judged = in_rng & (v >= _TINY_N) & (rel < 1.0)  # subnormal-range variances carry only a few bits  # a numerically constant gene makes the identity vacuous
     tol = rel * sst
     bad = judged & ~(np.abs(sst - (ssw + ssb)) <= tol)
     trigger_if(bool(np.any(bad)), "SC-AGG-001")
@@ -1128,6 +1180,9 @@ def check_combat(adata, data, corrected, key, covariates):
         sxx = (xc0**2).sum(axis=0)
         ok = sxx > len(idx) * (1e-9 * np.abs(xo.mean(axis=0))) ** 2
         ok &= sxx > 0
+        # ComBat adds back the pooled location: a batch whose spread is below the rounding of the gene's
+        # overall magnitude cannot carry its affine image (e.g. 1e-50 vs 1e50 across batches)
+        ok &= np.sqrt(sxx / len(idx)) > _C * eps * np.max(np.abs(orig), axis=0)
         if not ok.any():
             continue
         slope = (xc0[:, ok] * yc0[:, ok]).sum(axis=0) / sxx[ok]
@@ -1177,10 +1232,10 @@ def check_pca(x, x_pca, pca_, zero_center, svd_solver, chunked):
         return
     eps = max(_eps_of(pca_.components_), _eps_of(x_pca), _eps_of(x))
     gap = float(np.min(np.abs(np.diff(ev)))) / max(float(ev[0]), 1e-300) if k > 1 else 1.0
-    m, vv = stats.mean_var(x, axis=0, correction=1)
+    m, vv = stats.mean_var(_as_f64(x), axis=0, correction=1)  # integer reference would wrap
     m, vv = np.asarray(m, dtype=np.float64), np.asarray(vv, dtype=np.float64)
     total = float(vv.sum())
-    if not total >= _TINY_N * n_vars:  # variances in the subnormal range: products lose precision
+    if not total >= max(_TINY_N, _tiny_n(x.dtype)) * n_vars:  # dtype-aware: float32 squares underflow below 1e-31  # variances in the subnormal range: products lose precision
         return
     # variances past the dtype range (inf) make every ratio inf/inf: outside the law's domain
     if not (np.isfinite(total) and np.all(np.isfinite(ev)) and np.all(np.isfinite(evr)) and np.all(np.isfinite(m))):
