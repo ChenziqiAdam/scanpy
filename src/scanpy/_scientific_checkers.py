@@ -186,6 +186,19 @@ def _range_limit(dtype):
     return 0.5 * float(np.finfo(np.float64).max)
 
 
+_TINY_N = float(np.finfo(np.float64).tiny) / _EPS  # below this, squares/variances lose precision (subnormal range)
+
+
+def _row_nnz_max(x):
+    """Max stored entries per row of the CSR view: recursive (sequential) sums of k terms err by (k-1)u."""
+    try:
+        c = x.tocsr() if _is_sparse(x) else sparse.csr_matrix(np.asarray(x))
+        return int(np.max(np.diff(c.indptr))) if c.shape[0] else 0
+    except Exception:
+        _swallowed()
+        return int(x.shape[1])
+
+
 def _log2(n):
     return math.log2(max(int(n), 1) + 2)
 
@@ -257,6 +270,7 @@ def check_normalize_total(snap, out, factors, *, target_sum, exclude, max_fracti
     if _has_duplicates(snap):  # not a well-formed matrix: stored entries and their scipy sum differ
         return
     log_n = _log2(n_vars)
+    seq = 2.0 * _row_nnz_max(snap)  # _normalize_csr accumulates each row sequentially: error <= (k-1)u
     # size factors (usable total / target) must be normal floats of the output dtype; a subnormal or
     # zero factor makes the division itself lose the scale (the documented law is undefined there)
     _high0, _ = _highly_expressed(snap, max_fraction, tot) if exclude else (np.zeros(n_vars, dtype=bool), None)
@@ -271,7 +285,7 @@ def check_normalize_total(snap, out, factors, *, target_sum, exclude, max_fracti
     if not exclude:
         target = float(target_sum) if target_sum is not None else float(np.median(tot[nonzero]))
         sums = _row_sums(out)[nonzero]
-        tol = _C * eps * log_n * target
+        tol = (_C * log_n + seq) * eps * target
         trigger_if(_violates(float(np.max(np.abs(sums - target))), tol), "SC-NRM-001")
     else:
         high, amb = _highly_expressed(snap, max_fraction, tot)
@@ -282,7 +296,7 @@ def check_normalize_total(snap, out, factors, *, target_sum, exclude, max_fracti
             pos = _row_sums(snap[:, certain]) > 0
             if pos.any():
                 ref = float(target_sum) if target_sum is not None else float(np.median(lo[pos]))
-                tol = _C * eps * log_n * ref
+                tol = (_C * log_n + seq) * eps * ref
                 if target_sum is not None:
                     bad = np.any((lo[pos] > ref + tol) | (hi[pos] < ref - tol))
                 else:  # no stated target: the cells' [lo, hi] intervals must share a common value
@@ -332,7 +346,7 @@ def check_normalize_total(snap, out, factors, *, target_sum, exclude, max_fracti
     res3, fac3 = run(alt)
     d = float(np.max(np.abs(_dense64(res3)[norm_rows] - out64[norm_rows])))
     f = float(np.max(np.abs(fac3[norm_rows] - fac_ref[norm_rows])))
-    tol = _C * eps * log_n
+    tol = (_C * log_n + seq) * eps
     trigger_if(
         _violates(d, tol * max(scale, 1e-300))
         or _violates(f, tol * max(float(np.max(np.abs(fac_ref[norm_rows]))), 1e-300)),
@@ -361,7 +375,8 @@ def check_scale(snap, out, *, zero_center, max_value, mask):
     eps = max(_eps_of(out), _eps_of(snap))  # statistics are accumulated in the input dtype
     mean_in = a_in.mean(axis=0)
     std_in = a_in.std(axis=0, ddof=1)
-    ok = std_in > 0
+    # a sum of squares past the float64 range makes the production std inf (outputs 0): outside the law
+    ok = (std_in > 0) & np.isfinite(std_in) & (np.max(np.abs(a_in), axis=0) ** 2 * n < _range_limit(np.float64))
     # SC-SCL-001 (law needs unclipped output)
     if max_value is None and ok.any():
         # the variance comes from a one-pass sum-of-squares mean_var: error ~ eps*(1 + mean^2/var)
@@ -420,11 +435,19 @@ def check_downsample(snap, out, *, total_counts, counts_per_cell, replace):
     if total_counts is not None:
         exp = min(float(a.sum()), float(int(total_counts)))
         bad_total = float(b.sum()) != exp
+        if bad_total and snap.dtype.kind == "f":  # library compares its total in the input dtype
+            ulp = float(np.spacing(np.asarray(a.sum(), dtype=snap.dtype)))
+            bad_total = not (0 < a.sum() - int(total_counts) <= ulp and float(b.sum()) == float(a.sum()))
     else:
         n_obs = a.shape[0]
         t = np.full(n_obs, counts_per_cell) if isinstance(counts_per_cell, (int, np.integer)) else np.asarray(counts_per_cell)
         exp = np.minimum(a.sum(axis=1), t.astype(np.float64))
-        bad_total = bool(np.any(b.sum(axis=1) != exp))
+        rs, bs = a.sum(axis=1), b.sum(axis=1)
+        wrong = bs != exp
+        if snap.dtype.kind == "f":  # a total within one input-dtype ulp above the target cannot be told apart
+            ulp = np.spacing(rs.astype(snap.dtype)).astype(np.float64)
+            wrong &= ~((rs - t > 0) & (rs - t <= ulp) & (bs == rs))
+        bad_total = bool(np.any(wrong))
     trigger_if(bad_total, "SC-DSM-001")
     if snap.dtype.kind in "iu" and replace:
         # with replacement one gene may receive every read of the cell: a target above the dtype
@@ -461,7 +484,7 @@ def check_regress_out(snap, res, regressors, categorical):
     cond = float(np.linalg.cond(d))
     if not cond <= 1e6:
         return
-    nonconst = np.any(y != y[0], axis=0)
+    nonconst = np.any(y != y[0], axis=0) & (np.max(np.abs(y), axis=0) >= _TINY_N)  # subnormal-range input
     if not nonconst.any():
         return
     eps = max(_eps_of(res), _eps_of(snap))
@@ -611,7 +634,7 @@ def check_top_segment(mtx, ns, out):
     if _has_duplicates(mtx) or float(rs.max()) > _range_limit(mtx.dtype):  # total not representable
         return
     eps = _eps_of(mtx)
-    tol = _C * eps * (math.sqrt(n_vars) + _log2(n_vars))
+    tol = _C * eps * (math.sqrt(n_vars) + _log2(n_vars)) + 4.0 * eps * n_vars  # sequential sums of <= n_vars terms
     o = out[rows].astype(np.float64)
     bad = bool(np.any(np.diff(o, axis=1) < -tol)) or bool(np.any(~(o <= 1.0 + tol)))
     if ns_s[-1] == n_vars:
@@ -655,7 +678,8 @@ def check_autocorr(metric, result):
     for i in pick:
         v = vals if vals.ndim == 1 else vals[int(i)]
         v = np.asarray(v.toarray()).ravel() if _is_sparse(v) else np.asarray(v).ravel()
-        if v.astype(np.float64).std() > 0 and np.isfinite(res[int(i) if vals.ndim == 2 else 0]):
+        _v = v.astype(np.float64)
+        if _v.std() > 0 and float(np.sum((_v - _v.mean()) ** 2)) >= _TINY_N and np.isfinite(res[int(i) if vals.ndim == 2 else 0]):
             rows.append((int(i), v))
     if not rows:
         return
@@ -680,14 +704,15 @@ def check_autocorr(metric, result):
         # SC-AUT-001: relabelling, same container as production
         with _quiet():
             r1 = float(np.atleast_1d(cls(gp, box(v[perm]))())[0])
-        bad1 |= _violates(abs(r1 - r0), _C * max(eps_v, _EPS) * kappa * _log2(n) * (1.0 + abs(r0)))
+        lg = _log2(n) + 2.0 * n / _C  # numba kernels: x.mean() and sum(z*z) are sequential n-term sums
+        bad1 |= _violates(abs(r1 - r0), _C * max(eps_v, _EPS) * kappa * lg * (1.0 + abs(r0)))
         # SC-AUT-002: affine invariance against a float64 baseline (dense vector kernels)
         a, b = -4.0, 2.0 ** math.ceil(math.log2(float(np.max(np.abs(v64))) + 1e-300))
         with _quiet():
             base = float(np.atleast_1d(cls(graph, v64)())[0])
             aff = float(np.atleast_1d(cls(graph, a * v64 + b)())[0])
         kap2 = 1.0 + (float(np.max(np.abs(v64))) + b) / std
-        bad2 |= _violates(abs(aff - base), _C * _EPS * kap2 * _log2(n) * (1.0 + abs(base)))
+        bad2 |= _violates(abs(aff - base), _C * _EPS * kap2 * lg * (1.0 + abs(base)))
         # SC-AUT-003: representation consistency
         tol3 = _C * max(_EPS, eps_v) * n * (1.0 + (mean / std) ** 2) * (1.0 + abs(r0))
         with _quiet():
@@ -812,12 +837,27 @@ def check_rank_genes_groups(adata, key, groupby, *, reference, method, use_raw, 
             if g not in r2["scores"].dtype.names:
                 continue
             xs = _dense64(x)
+            if not mean_in_log_space:  # statistics are computed on the exponentiated values
+                _b = adata.uns.get("log1p", {}).get("base")
+                xs = np.expm1(xs * np.log(_b)) if _b is not None else np.expm1(xs)
             kappa = 1.0 + float(np.max(xs.mean(axis=0) ** 2 / np.maximum(xs.var(axis=0, ddof=1), 1e-300)))
+            # means_rest = (sum_h n_h m_h - n_g m_g) / n_rest: absolute error ~ eps * sum_h n_h |m_h| / n_rest
+            gm = (obs == cats[g]).to_numpy()
+            m_rest = xs[~gm].mean(axis=0)
+            d_rest = _C * _EPS * _log2(n_obs) * np.abs(xs).sum(axis=0) / max(int((~gm).sum()), 1)
+            lfc_tol = d_rest / ((np.abs(m_rest) + 1e-9) * math.log(2.0))
+            idx_n = {nm: i for i, nm in enumerate(names.tolist())}
             for fld in ("scores", "logfoldchanges") if have_lfc else ("scores",):
                 a, b = _res_by_name(res, fld, g), _res_by_name(r2, fld, g)
                 for nm, v in a.items():
                     if nm in b and np.isfinite(v) and np.isfinite(b[nm]):
-                        bad["002"] |= _violates(abs(v - b[nm]), _C * (eps32 + _EPS * n_obs * kappa) * (1.0 + abs(v)))
+                        extra = 0.0
+                        if fld == "logfoldchanges":
+                            j = idx_n[nm]
+                            if lfc_tol[j] >= 0.5:  # rest mean not resolvable at all: law undefined
+                                continue
+                            extra = float(lfc_tol[j])
+                        bad["002"] |= _violates(abs(v - b[nm]), _C * (eps32 + _EPS * n_obs * kappa) * (1.0 + abs(v)) + extra)
     # SC-DE-004: log fold change direction vs. the means
     if have_lfc and _min_value(x) >= 0:  # (m + pseudocount) ratios only order means for non-negative data
         xs_all = x
@@ -846,7 +886,8 @@ def check_rank_genes_groups(adata, key, groupby, *, reference, method, use_raw, 
                 if i is None or not np.isfinite(v):
                     continue
                 dm = mg[i] - mr[i]
-                tol = _C * eps_x * (abs(mg[i]) + abs(mr[i])) * _log2(n_obs) + 1e-8 * (abs(mg[i]) + abs(mr[i]))
+                # lfc = log2((mg+1e-9)/(mr+1e-9)): a mean difference below rounding of the pseudocounted means is unresolvable
+                tol = _C * max(eps_x, _EPS) * (abs(mg[i]) + abs(mr[i]) + 1e-9) * _log2(n_obs) + 1e-8 * (abs(mg[i]) + abs(mr[i]))
                 if abs(dm) > tol and v != 0:
                     bad["004"] |= (np.sign(v) != np.sign(dm))
                 elif abs(dm) > tol and v == 0:
@@ -953,7 +994,8 @@ def check_score_genes(adata, gene_list, rng0, *, ctrl_as_ref, ctrl_size, gene_po
         return
     # SC-SG-001: order invariance (production dtype)
     rev = run(x.copy(), glist[::-1])
-    tol = _C * max(eps, _EPS) * scale * _log2(len(names))
+    seq = 4.0 * len(names)  # _sparse_nanmean_* accumulate sequentially: mean error <= (k-1)u*max|x|
+    tol = (_C * _log2(len(names)) + seq) * max(eps, _EPS) * scale
     trigger_if(_violates(float(np.max(np.abs(rev - prod))), tol), "SC-SG-001")
     # SC-SG-002: additive shift, float64 baseline vs shifted
     xd = _dense64(x)
@@ -973,7 +1015,7 @@ def check_score_genes(adata, gene_list, rng0, *, ctrl_as_ref, ctrl_size, gene_po
     moved = run(xd + shift, glist)
     if not (np.all(np.isfinite(base)) and np.all(np.isfinite(moved))):
         return
-    trigger_if(_violates(float(np.max(np.abs(moved - base))), _C * _EPS * (scale + shift) * _log2(len(names))), "SC-SG-002")
+    trigger_if(_violates(float(np.max(np.abs(moved - base))), (_C * _log2(len(names)) + seq) * _EPS * (scale + shift)), "SC-SG-002")
 
 
 @_guarded
@@ -1040,6 +1082,8 @@ def check_aggregate(data, by, mask, result, dof):
     var_g = np.asarray(result["var"], dtype=np.float64)
     nonempty = counts > 0
     xk = data[keep] if not _is_sparse(data) else data.tocsr()[keep]
+    if xk.dtype.kind in "iub":  # integer accumulators would wrap in the reference computation
+        xk = xk.astype(np.float64)
     m, v = stats.mean_var(xk, axis=0, correction=1)
     m, v = np.asarray(m, dtype=np.float64), np.asarray(v, dtype=np.float64)
     ssw = np.where((counts >= 2)[:, None], (counts[:, None] - 1.0) * np.nan_to_num(var_g), 0.0)[nonempty].sum(axis=0)
@@ -1048,7 +1092,7 @@ def check_aggregate(data, by, mask, result, dof):
     kappa = 1.0 + m**2 / np.maximum(v, 1e-300)
     # the statistics are accumulated in the dtype of the data (float32 data: ~1e-6 relative)
     rel = _C * max(_EPS, _eps_of(data)) * n_tot * kappa
-    judged = (v > 0) & (rel < 1.0)  # a numerically constant gene makes the identity vacuous
+    judged = (v >= _TINY_N) & (rel < 1.0)  # subnormal-range variances carry only a few bits  # a numerically constant gene makes the identity vacuous
     tol = rel * sst
     bad = judged & ~(np.abs(sst - (ssw + ssb)) <= tol)
     trigger_if(bool(np.any(bad)), "SC-AGG-001")
@@ -1089,7 +1133,10 @@ def check_combat(adata, data, corrected, key, covariates):
         slope = (xc0[:, ok] * yc0[:, ok]).sum(axis=0) / sxx[ok]
         resid = yc0[:, ok] - slope * xc0[:, ok]
         yn = np.linalg.norm(yc0[:, ok], axis=0)
-        kappa = 1.0 + np.abs(xo.mean(axis=0)[ok]) / np.sqrt(sxx[ok] / len(idx))
+        syy = (yc0[:, ok] ** 2).sum(axis=0)
+        # outputs are stored at the batch-corrected location: their own rounding is eps*|mean_out|/sd_out
+        kappa = (1.0 + np.abs(xo.mean(axis=0)[ok]) / np.sqrt(sxx[ok] / len(idx))
+                 + np.abs(xc.mean(axis=0)[ok]) / np.sqrt(np.maximum(syy, 1e-300) / len(idx)))
         rel = np.linalg.norm(resid, axis=0) / np.maximum(yn, 1e-300)
         bad |= bool(np.any(~(rel <= _C * eps * kappa * math.sqrt(len(idx))))) or bool(np.any(slope <= 0))
     trigger_if(bad, "SC-CMB-002")
@@ -1133,7 +1180,7 @@ def check_pca(x, x_pca, pca_, zero_center, svd_solver, chunked):
     m, vv = stats.mean_var(x, axis=0, correction=1)
     m, vv = np.asarray(m, dtype=np.float64), np.asarray(vv, dtype=np.float64)
     total = float(vv.sum())
-    if not total > 0:
+    if not total >= _TINY_N * n_vars:  # variances in the subnormal range: products lose precision
         return
     # variances past the dtype range (inf) make every ratio inf/inf: outside the law's domain
     if not (np.isfinite(total) and np.all(np.isfinite(ev)) and np.all(np.isfinite(evr)) and np.all(np.isfinite(m))):

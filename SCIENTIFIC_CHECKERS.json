@@ -4,7 +4,7 @@
   "note": "Complete public scientific-checker bank. Inactive unless SCIBENCH_TRIGGER_LOG is set.",
   "checkers": [
     {
-      "alarm": "max |row_sum(out) - target| > 64*eps*(log2(n_vars)+2)*target (eps of the output dtype; row sums in float64) or a non-finite output.",
+      "alarm": "max |row_sum(out) - target| > (64*log2(n_vars)+128+2*k_max)*eps*target (eps of the output dtype; row sums in float64) or a non-finite output. (k_max = largest number of stored entries in a row; sequential row sums accumulate error ~ k*eps.)",
       "family": "size_factor_equalisation",
       "id": "SC-NRM-001",
       "invariant": "After normalisation every such cell has the same total count, equal to target_sum (or the median of the original non-zero cell totals when target_sum is None).",
@@ -16,7 +16,7 @@
       "symbol": "normalize_total"
     },
     {
-      "alarm": "target (or, when None, the common value) lies outside [sum over certainly-retained genes, + ambiguous genes] by more than 64*eps*(log2(n_vars)+2)*target.",
+      "alarm": "target (or, when None, the common value) lies outside [sum over certainly-retained genes, + ambiguous genes] by more than (64*log2(n_vars)+128+2*k_max)*eps*target. (k_max = largest number of stored entries in a row; sequential row sums accumulate error ~ k*eps.)",
       "family": "highly_expressed_exclusion_sum",
       "id": "SC-NRM-002",
       "invariant": "The genes that are not highly expressed (documented: no cell has more than max_fraction of its total counts in the gene) sum to target_sum in every cell with a positive retained total; with target_sum=None they are equal across cells. Ambiguous genes widen the retained sum to an interval [certain, certain+ambiguous].",
@@ -40,7 +40,7 @@
       "symbol": "normalize_total"
     },
     {
-      "alarm": "max |N(dense) - N(csr)| or the size-factor difference exceeds 64*eps*(log2(n_vars)+2)*max|.|.",
+      "alarm": "max |N(dense) - N(csr)| or the size-factor difference exceeds (64*(log2(n_vars)+2)+2*k_max)*eps*max|.|. (k_max = largest number of stored entries in a row; sequential row sums accumulate error ~ k*eps.)",
       "family": "normalize_representation_consistency",
       "id": "SC-NRM-004",
       "invariant": "Dense and CSR storage of the same values give the same normalised matrix and size factors.",
@@ -57,7 +57,7 @@
       "id": "SC-SCL-001",
       "invariant": "Scaled genes have sample variance (ddof=1) 1 over the observations used for the statistics, and mean 0 when zero_center=True.",
       "observation_point": "At return of scale_array.",
-      "precondition": "Finite data, n_obs >= 2 over the rows used, max_value=None, genes with positive input sample variance, any storage and mask. Sparse input is in canonical format (no repeated (row, column) entries).",
+      "precondition": "Finite data, n_obs >= 2 over the rows used, max_value=None, genes with finite positive input sample variance (sum of squares within the float64 range), any storage and mask. Sparse input is in canonical format (no repeated (row, column) entries).",
       "rationale": "z-scoring is only meaningful if the output actually has unit variance and zero mean.",
       "scientific_quantity": "standardised gene expression",
       "source": "src/scanpy/preprocessing/_scale.py",
@@ -88,7 +88,7 @@
       "symbol": "scale"
     },
     {
-      "alarm": "Any cell total (or the matrix total) differs from min(original, target) (exact integer comparison).",
+      "alarm": "Any cell total (or the matrix total) differs from min(original, target) (exact integer comparison). For float dtypes, a total exceeding the target by at most one ulp of the input dtype (unchanged by the library) is not an alarm.",
       "family": "downsample_total_conservation",
       "id": "SC-DSM-001",
       "invariant": "Afterwards each cell total (or the matrix total) equals min(original, target).",
@@ -117,7 +117,7 @@
       "id": "SC-RGO-001",
       "invariant": "Each gene's residual is orthogonal to every column of D (linear dependence removed, residual mean 0).",
       "observation_point": "Before regress_out stores its result; compared with a snapshot of the input.",
-      "precondition": "Numeric keys, design D=[1, keys] of full column rank with cond(D) <= 1e6 (raw, unscaled D), non-constant genes.",
+      "precondition": "Numeric keys, design D=[1, keys] of full column rank with cond(D) <= 1e6 (raw, unscaled D), non-constant genes with max|y| >= finfo(float64).tiny/eps.",
       "rationale": "Regressing out a covariate must remove its linear influence on the expression.",
       "scientific_quantity": "covariate-adjusted expression",
       "source": "src/scanpy/preprocessing/_simple.py",
@@ -184,7 +184,7 @@
       "symbol": "_highly_variable_genes_seurat_v3"
     },
     {
-      "alarm": "decrease > 64*eps*(sqrt(n_vars)+log2(n_vars)), value > 1 + that slack, value at n_vars differing from 1 by more than it, or non-finite.",
+      "alarm": "decrease > (64*(sqrt(n_vars)+log2(n_vars))+4*n_vars)*eps, value > 1 + that slack, value at n_vars differing from 1 by more than it, or non-finite.",
       "family": "top_proportion_monotone_bounded",
       "id": "SC-QC-001",
       "invariant": "Cumulative proportions are non-decreasing in n, lie in [0,1], and equal 1 at n = n_vars.",
@@ -196,7 +196,7 @@
       "symbol": "top_segment_proportions"
     },
     {
-      "alarm": "max difference > 64*eps*(sqrt(n_vars)+log2(n_vars)).",
+      "alarm": "max difference > (64*(sqrt(n_vars)+log2(n_vars))+4*n_vars)*eps.",
       "family": "top_proportion_sparse_dense",
       "id": "SC-QC-002",
       "invariant": "The proportions of the same matrix do not depend on dense vs CSR storage.",
@@ -208,7 +208,7 @@
       "symbol": "top_segment_proportions"
     },
     {
-      "alarm": "max difference > 64*eps*(sqrt(n_vars)+log2(n_vars)).",
+      "alarm": "max difference > (64*(sqrt(n_vars)+log2(n_vars))+4*n_vars)*eps.",
       "family": "top_proportion_cross_method",
       "id": "SC-QC-003",
       "invariant": "top_proportions(m, n)[:, k-1] equals top_segment_proportions(m, ns)[:, j] for each k = ns[j] (the same cumulative share of the k most expressed genes).",
@@ -220,24 +220,24 @@
       "symbol": "top_segment_proportions"
     },
     {
-      "alarm": "|stat(P) - stat| > 64*eps*max(eps_values,eps64)*(1+|mean|/std)*(log2(n)+2)*(1+|stat|).",
+      "alarm": "|stat(P) - stat| > 64*eps*max(eps_values,eps64)*(1+|mean|/std)*(log2(n)+2+2n/64)*(1+|stat|).",
       "family": "autocorr_relabeling_invariance",
       "id": "SC-AUT-001",
       "invariant": "Permuting the observations (graph rows and columns together with the values) leaves the statistic unchanged.",
       "observation_point": "After the statistic is computed (up to 4 features); re-called on permuted inputs in the production dtype.",
-      "precondition": "Square non-negative finite graph, finite values with positive variance. Sparse input is in canonical format (no repeated (row, column) entries).",
+      "precondition": "Square non-negative finite graph, finite values with positive variance. Sparse input is in canonical format (no repeated (row, column) entries). Features whose sum of squared deviations is below finfo(float64).tiny/eps (subnormal range) are not judged.",
       "rationale": "Spatial autocorrelation cannot depend on the arbitrary order in which cells are stored.",
       "scientific_quantity": "Moran's I / Geary's C",
       "source": "src/scanpy/metrics/_common.py",
       "symbol": "_SparseMetric.__call__"
     },
     {
-      "alarm": "|stat(ax+b) - stat(x)| > 64*eps*eps64*(1+(max|x|+|b|)/std)*(log2(n)+2)*(1+|stat|).",
+      "alarm": "|stat(ax+b) - stat(x)| > 64*eps*eps64*(1+(max|x|+|b|)/std)*(log2(n)+2+2n/64)*(1+|stat|).",
       "family": "autocorr_affine_invariance",
       "id": "SC-AUT-002",
       "invariant": "x -> a*x + b (a != 0) leaves the statistic unchanged.",
       "observation_point": "After the statistic is computed; re-called with a=-4 and b a power of two near max|x| against a float64 baseline re-call.",
-      "precondition": "As SC-AUT-001, values promoted to float64.",
+      "precondition": "As SC-AUT-001, values promoted to float64. Features whose sum of squared deviations is below finfo(float64).tiny/eps are not judged.",
       "rationale": "Both statistics are defined on standardised deviations from the mean.",
       "scientific_quantity": "Moran's I / Geary's C",
       "source": "src/scanpy/metrics/_common.py",
@@ -249,7 +249,7 @@
       "id": "SC-AUT-003",
       "invariant": "Vector, dense-matrix row and CSR-matrix row of the same values give the same statistic.",
       "observation_point": "After the statistic is computed; re-called through dense and CSR 2-D representations.",
-      "precondition": "As SC-AUT-001.",
+      "precondition": "As SC-AUT-001. Features whose sum of squared deviations is below finfo(float64).tiny/eps are not judged.",
       "rationale": "The result must not depend on the container of the values.",
       "scientific_quantity": "Moran's I / Geary's C",
       "source": "src/scanpy/metrics/_common.py",
@@ -268,7 +268,7 @@
       "symbol": "rank_genes_groups"
     },
     {
-      "alarm": "scores or log fold changes differ by > 64*eps*(eps32 + eps64*n_obs*kappa)*(1+|v|) with kappa = 1 + max_gene mean^2/var.",
+      "alarm": "scores or log fold changes differ by > 64*eps*(eps32 + eps64*n_obs*kappa)*(1+|v|) with kappa = 1 + max_gene mean^2/var of the statistics' space (expm1 of the data when mean_in_log_space=False). Log fold changes are compared with an additional allowance for the rest-group mean (computed by subtraction): 64*eps*log2(n_obs)*sum|x|/n_rest/(ln2*(|m_rest|+1e-9)); genes where this allowance is >= 0.5 are not judged.",
       "family": "de_rest_vs_reference",
       "id": "SC-DE-002",
       "invariant": "Comparing a group to 'rest' and to the other group are the same comparison.",
@@ -297,7 +297,7 @@
       "id": "SC-DE-004",
       "invariant": "sign(lfc) = sign(mean_group - mean_reference), with means taken in the space the function documents (mean of the data when mean_in_log_space=True, mean of expm1(data) when False); expm1 and the pseudocount are monotone.",
       "observation_point": "At return of rank_genes_groups; means computed from the same data matrix.",
-      "precondition": "t-test, t-test_overestim_var or wilcoxon; non-negative expression data; finite logfoldchanges; mean difference larger than 64*eps*(|m_g|+|m_r|)*log2(n) + 1e-8*(|m_g|+|m_r|). Sparse input is in canonical format (no repeated (row, column) entries).",
+      "precondition": "t-test, t-test_overestim_var or wilcoxon; non-negative expression data; finite logfoldchanges; mean difference larger than 64*max(eps_x,eps64)*(|m_g|+|m_r|+1e-9)*log2(n) + 1e-8*(|m_g|+|m_r|). Sparse input is in canonical format (no repeated (row, column) entries).",
       "rationale": "The direction of a fold change must follow the direction of the expression difference.",
       "scientific_quantity": "log fold change",
       "source": "src/scanpy/tools/_rank_genes_groups.py",
@@ -328,7 +328,7 @@
       "symbol": "_RankGenes._basic_stats"
     },
     {
-      "alarm": "max |score(reversed) - score| > 64*eps*max(eps_x,eps64)*max|X|*(log2(n_vars)+2).",
+      "alarm": "max |score(reversed) - score| > (64*log2(n_vars)+4*n_vars)*max(eps_x,eps64)*max|X|.",
       "family": "score_genes_order_invariance",
       "id": "SC-SG-001",
       "invariant": "A gene signature is a set: reordering gene_list (same random state) leaves the scores unchanged.",
@@ -340,7 +340,7 @@
       "symbol": "score_genes"
     },
     {
-      "alarm": "max |score(X+c) - score(X)| > 64*eps*eps64*(max|X|+c)*(log2(n_vars)+2).",
+      "alarm": "max |score(X+c) - score(X)| > (64*log2(n_vars)+4*n_vars)*eps64*(max|X|+c).",
       "family": "score_genes_shift_invariance",
       "id": "SC-SG-002",
       "invariant": "Adding a constant to all expression values leaves the score unchanged (a difference of means; control bins use ranks).",
@@ -376,12 +376,12 @@
       "symbol": "Neighbors.compute_neighbors"
     },
     {
-      "alarm": "|SST - (SSW+SSB)| > 64*eps*max(eps64,eps_data)*N*(1+mean^2/var)*SST per gene.",
+      "alarm": "|SST - (SSW+SSB)| > 64*eps*max(eps64,eps_data)*N*(1+mean^2/var)*SST per gene. Integer input is accumulated in float64 for the reference.",
       "family": "variance_decomposition",
       "id": "SC-AGG-001",
       "invariant": "(N-1)*Var_total = sum_g (n_g-1)*Var_g + sum_g n_g*(mean_g - mean)^2 (law of total variance).",
       "observation_point": "Before aggregate_array returns; Var_total from fast_array_utils.stats.mean_var.",
-      "precondition": "mean and var requested with dof=1, finite data, >= 3 observations kept; genes whose error bound 64*eps*N*(1+mean^2/var) reaches 1 or whose variance is not positive (numerically constant) are not judged. Sparse input is in canonical format (no repeated (row, column) entries).",
+      "precondition": "mean and var requested with dof=1, finite data, >= 3 observations kept; genes whose error bound 64*eps*N*(1+mean^2/var) reaches 1 or whose variance is below finfo(float64).tiny/eps (numerically constant or subnormal) are not judged. Sparse input is in canonical format (no repeated (row, column) entries).",
       "rationale": "Group-wise statistics must reassemble to the overall variance.",
       "scientific_quantity": "group mean and variance",
       "source": "src/scanpy/get/_aggregated.py",
@@ -400,7 +400,7 @@
       "symbol": "combat"
     },
     {
-      "alarm": "relative residual of the within-batch linear fit > 64*eps*(1+|mean|/std)*sqrt(n_batch) or a non-positive slope.",
+      "alarm": "relative residual of the within-batch linear fit > 64*eps*(1+|mean_in|/std_in+|mean_out|/std_out)*sqrt(n_batch) or a non-positive slope.",
       "family": "combat_within_batch_affine",
       "id": "SC-CMB-002",
       "invariant": "Within one batch each gene's corrected values are a positive affine function of its original values (location-scale model).",
@@ -417,7 +417,7 @@
       "id": "SC-PCA-001",
       "invariant": "PCs^T PCs = I, scores are uncorrelated (adjacent component gap >= 1e-2*lambda_1), each score variance equals the reported component variance.",
       "observation_point": "Before pca stores its result.",
-      "precondition": "zero_center=True, solver arpack/covariance_eigh/full, not chunked, finite data. Total variance and component variances are finite.",
+      "precondition": "zero_center=True, solver arpack/covariance_eigh/full, not chunked, finite data. Total variance is finite and at least finfo(float64).tiny/eps*n_vars.",
       "rationale": "These are the defining properties of a PCA.",
       "scientific_quantity": "principal components",
       "source": "src/scanpy/preprocessing/_pca/__init__.py",
