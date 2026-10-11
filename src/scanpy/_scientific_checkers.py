@@ -198,6 +198,18 @@ def _tiny_n(dtype):
     return _TINY_N
 
 
+def _outside_dtype_range(total, dtype):
+    """True when an accumulated quantity (``total``, float64) reaches the range of the input ``dtype``.
+
+    The library accumulates in the input dtype, so such a total overflows (or is lossy) there and the
+    laws below are not judged for it.
+    """
+    try:
+        return not float(np.max(total)) < _range_limit(dtype)
+    except Exception:
+        return True
+
+
 def _as_f64(x):
     """float64 copy for reference statistics (integer/float32 accumulators wrap or underflow)."""
     return x if x.dtype == np.float64 else x.astype(np.float64)
@@ -280,6 +292,8 @@ def check_normalize_total(snap, out, factors, *, target_sum, exclude, max_fracti
     tot = _row_sums(snap)
     nonzero = tot > 0
     if not nonzero.any():
+        return
+    if _outside_dtype_range(tot, snap.dtype):  # cell totals overflow the input dtype's range
         return
     if _has_duplicates(snap):  # not a well-formed matrix: stored entries and their scipy sum differ
         return
@@ -763,6 +777,11 @@ def check_autocorr(metric, result):
         # worst-case numerator magnitude (Geary: (n-1)*sum w (y_i-y_j)^2; Moran: n*sum w z_i z_j)
         _wsum = max(1.0, float(abs(graph).sum()))
         in_range = bool(np.float64(2.0 * (abs(a) * float(np.max(np.abs(v64))) + b)) ** 2 * n * _wsum < _range_limit(np.float64))
+        # smallest product the kernels form (weight * squared deviation) must be a normal float64
+        _gd = abs(graph).data if _is_sparse(graph) else np.abs(np.asarray(graph)).ravel()
+        _gd = _gd[_gd > 0]
+        if _gd.size:
+            in_range = in_range and float(_gd.min()) * float(np.mean((v64 - mean) ** 2)) >= _TINY_N
         bad2 |= in_range and _violates(abs(aff - base), _C * _EPS * kap2 * lg * (1.0 + abs(base)))
         # SC-AUT-003: representation consistency
         tol3 = _C * max(_EPS, eps_v) * n * (1.0 + (mean / std) ** 2) * (1.0 + abs(r0))
@@ -1085,6 +1104,19 @@ def check_connectivities(w, method, distances=None):
     # unbounded (width-dependent) factor, so that leg is judged for float64 distances only
     if method == "gauss" and distances is not None and np.dtype(distances.dtype).itemsize < 8:
         return
+    # the gaussian kernel is symmetric only for symmetric input dissimilarities (kNN graphs are directed by
+    # construction, so only mutually stored pairs are compared)
+    if method == "gauss" and distances is not None:
+        _d = distances.tocsr() if _is_sparse(distances) else np.asarray(distances, dtype=np.float64)
+        if _is_sparse(_d):
+            _m = (_d != 0).multiply(_d.T != 0)
+            _asym = abs(_d.multiply(_m) - _d.T.multiply(_m)).max() if _m.nnz else 0.0
+            _dmax = abs(_d).max() if _d.nnz else 0.0
+        else:
+            _asym = np.max(np.abs(_d - _d.T)) if _d.size else 0.0
+            _dmax = np.max(np.abs(_d)) if _d.size else 0.0
+        if not float(_asym) <= _C * _eps_of(distances) * max(float(_dmax), 1e-300):
+            return
     eps = _eps_of(w)
     # non-finite weights (e.g. a zero local scale at duplicate points) are not judged here
     if _is_sparse(w):
