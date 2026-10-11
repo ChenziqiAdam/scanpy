@@ -392,6 +392,8 @@ def check_scale(snap, out, *, zero_center, max_value, mask):
         return
     if _has_duplicates(snap):
         return
+    if snap.dtype.kind not in "fiu":  # bool storage cannot hold scaled values (dense bool is never snapshotted)
+        return
     zero_center = bool(zero_center)
     n_obs = snap.shape[0]
     rows = np.ones(n_obs, dtype=bool) if mask is None else np.asarray(mask, dtype=bool)
@@ -482,10 +484,12 @@ def check_downsample(snap, out, *, total_counts, counts_per_cell, replace):
             wrong &= ~((np.abs(rs - t) <= ulp) & ((bs == rs) | (bs == t)))
         bad_total = bool(np.any(wrong))
     top = float(np.max(exp)) if np.ndim(exp) else float(exp)
-    if snap.dtype.kind in "iu" and replace:
+    if snap.dtype.kind in "iub" and replace:
         # with replacement one gene may receive every read of the cell: a target above the dtype
-        # maximum wraps around (compact integer dtype), which is outside both invariants' domain
-        if top > float(np.iinfo(snap.dtype).max):
+        # maximum wraps around (compact integer dtype) or saturates (bool holds at most 1 read),
+        # which is outside both invariants' domain
+        cap = 1.0 if snap.dtype.kind == "b" else float(np.iinfo(snap.dtype).max)
+        if top > cap:
             return
     if snap.dtype.kind == "f":
         # a single entry that may need to hold more reads than the dtype's consecutive-integer limit
@@ -608,6 +612,12 @@ def check_hvg_selection(adata, df, *, batch_key, layer, cutoff, n_bins, flavor, 
         populated = obs.astype("category").cat.remove_unused_categories().cat.categories
         if len(populated) != 1:
             return
+        labeled = obs.notna().to_numpy()
+        if not labeled.all():
+            # the batched path uses only cells assigned to a batch: the unbatched reference must too
+            if labeled.sum() < 2:
+                return
+            adata = adata[labeled].copy()
         x = _get_arr(adata, layer=layer)
         if not (isinstance(x, np.ndarray) or _is_sparse(x)):
             return
