@@ -310,6 +310,10 @@ def check_normalize_total(snap, out, factors, *, target_sum, exclude, max_fracti
         _fac = _pos / _tgt if _tgt > 0 else _pos
         if _tgt <= 0 or float(_fac.min()) < float(_fi.tiny) / _EPS or float(_fac.max()) > float(_fi.max) * _EPS:
             return
+        # the normalised entries sum to the target: a target below tiny/eps of the output dtype puts them
+        # in the subnormal range, where they carry too few bits for the law to be judged
+        if _tgt < _tiny_n(out.dtype):
+            return
     if not exclude:
         target = float(target_sum) if target_sum is not None else float(np.median(tot[nonzero]))
         sums = _row_sums(out)[nonzero]
@@ -528,7 +532,7 @@ def check_regress_out(snap, res, regressors, categorical):
     cond = float(np.linalg.cond(d))
     if not cond <= 1e6:
         return
-    nonconst = np.any(y != y[0], axis=0) & (np.max(np.abs(y), axis=0) >= _TINY_N)  # subnormal-range input
+    nonconst = np.any(y != y[0], axis=0) & (np.max(np.abs(y), axis=0) >= _tiny_n(snap.dtype))  # subnormal-range input (of the input dtype)
     if not nonconst.any():
         return
     eps = max(_eps_of(res), _eps_of(snap))
@@ -646,6 +650,20 @@ def check_hvg_selection(adata, df, *, batch_key, layer, cutoff, n_bins, flavor, 
         with np.errstate(divide="ignore", invalid="ignore"):
             _cond = np.where(_dev > 0, (np.abs(_d2) + _avg) / _dev, 0.0)
         _cond = np.nan_to_num(_cond, nan=0.0, posinf=0.0)
+        # dispersions come from a one-pass variance whose relative error is ~eps*(1 + mean^2/var) per gene
+        # (computed on the values the flavor uses: expm1 of the data for seurat)
+        _xv = _dense64(x) if _size(x) <= _MAX_ELEMS else None
+        if _xv is None:
+            return
+        if flavor == "seurat":
+            _xv = np.expm1(_xv)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            _kv = 1.0 + _xv.mean(axis=0) ** 2 / _xv.var(axis=0, ddof=1)
+        import pandas as pd
+
+        _kv = np.where(np.isfinite(_kv), _kv, 1.0)
+        # ``x`` is in adata.var order; df (and df2, reindexed to it) may be ordered differently
+        _kv_df = pd.Series(_kv, index=adata.var_names).reindex(df.index).fillna(1.0).to_numpy(dtype=np.float64)
         for col in ("means", "dispersions", "dispersions_norm"):
             a = df[col].to_numpy(dtype=np.float64)
             b = df2[col].to_numpy(dtype=np.float64)
@@ -653,8 +671,9 @@ def check_hvg_selection(adata, df, *, batch_key, layer, cutoff, n_bins, flavor, 
                 a, b = np.nan_to_num(a, nan=0.0), np.nan_to_num(b, nan=0.0)
             same_nan = np.array_equal(np.isnan(a), np.isnan(b))
             f = np.isfinite(a) & np.isfinite(b)
+            kv = _kv_df[f] if col != "means" else 1.0
             amp = (_cond[f] * (2.0 + np.abs(a[f]))) if col == "dispersions_norm" else 0.0
-            diff = np.abs(a[f] - b[f]) - _C * _EPS * (1.0 + np.abs(a[f]) + amp) * _log2(len(a))
+            diff = np.abs(a[f] - b[f]) - _C * _EPS * (1.0 + np.abs(a[f]) + amp) * kv * _log2(len(a))
             bad |= (not same_nan) or bool(np.any(diff > 0))
         n2 = df2["dispersions_norm"].to_numpy(dtype=np.float64)
         f2 = n2[np.isfinite(n2)]
@@ -668,7 +687,7 @@ def check_hvg_selection(adata, df, *, batch_key, layer, cutoff, n_bins, flavor, 
         near_tie = False
         if isinstance(cutoff, (int, np.integer)) and not isinstance(cutoff, bool) and 0 < int(cutoff) < f2.size:
             fin2 = np.isfinite(n2)
-            tol_n = _C * _EPS * (1.0 + np.abs(n2[fin2]) + _cond[fin2] * (2.0 + np.abs(n2[fin2]))) * _log2(len(n2))
+            tol_n = _C * _EPS * (1.0 + np.abs(n2[fin2]) + _cond[fin2] * (2.0 + np.abs(n2[fin2]))) * _kv_df[fin2] * _log2(len(n2))
             order = np.argsort(-n2[fin2])
             k = int(cutoff)
             near_tie = bool(n2[fin2][order[k - 1]] - n2[fin2][order[k]] <= tol_n[order[k - 1]] + tol_n[order[k]])
@@ -764,6 +783,7 @@ def check_autocorr(metric, result):
         return sparse.csr_matrix(v[None, :]) if kind == "sparse" else v[None, :]
 
     perm = np.random.default_rng(12345).permutation(n)
+    _wsum1 = max(1.0, float(abs(graph).sum()))
     gp = graph.tocsr()[perm][:, perm]
     bad1 = bad2 = bad3 = False
     for i, v in rows:
@@ -777,7 +797,11 @@ def check_autocorr(metric, result):
         with _quiet():
             r1 = float(np.atleast_1d(cls(gp, box(v[perm]))())[0])
         lg = _log2(n) + 2.0 * n / _C  # numba kernels: x.mean() and sum(z*z) are sequential n-term sums
-        bad1 |= _violates(abs(r1 - r0), _C * max(eps_v, _EPS) * kappa * lg * (1.0 + abs(r0)))
+        # partial sums of w_ij z_i z_j (Geary: w_ij (y_i - y_j)^2) must stay in the float64 range in every
+        # summation order; otherwise the relabelled sum may overflow where the original did not
+        _zmax = float(np.max(np.abs(v64 - mean)))
+        if 4.0 * _zmax**2 * n * _wsum1 < _range_limit(np.float64):
+            bad1 |= _violates(abs(r1 - r0), _C * max(eps_v, _EPS) * kappa * lg * (1.0 + abs(r0)))
         # SC-AUT-002: affine invariance against a float64 baseline (dense vector kernels)
         a, b = -4.0, 2.0 ** math.ceil(math.log2(float(np.max(np.abs(v64))) + 1e-300))
         with _quiet():
@@ -826,6 +850,8 @@ def _slim(adata, groupby, x, names, negate=False):
 
     xx = x.copy()
     if negate:
+        if np.dtype(xx.dtype).kind == "i":  # -iinfo.min wraps around in the input dtype: negate in float64
+            xx = xx.astype(np.float64)
         xx = -xx
     obs = pd.DataFrame({groupby: adata.obs[groupby].astype("category")}, index=adata.obs_names)
     slim = AnnData(X=xx, obs=obs, var=pd.DataFrame(index=names))
