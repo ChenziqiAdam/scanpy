@@ -691,7 +691,11 @@ def check_hvg_selection(adata, df, *, batch_key, layer, cutoff, n_bins, flavor, 
             order = np.argsort(-n2[fin2])
             k = int(cutoff)
             near_tie = bool(n2[fin2][order[k - 1]] - n2[fin2][order[k]] <= tol_n[order[k - 1]] + tol_n[order[k]])
-        if len(np.unique(f2)) == len(f2) and not over_asked and not near_tie:  # no (near-)ties: selection must match too
+        # a bin whose genes all share one dispersion has zero spread: the normalised scores are 0/0 or +-inf, and
+        # the selection among them is not a law of the estimator
+        _bins = df2.groupby("mean_bin", observed=True)["dispersions"].transform("size").to_numpy()
+        zero_spread = bool(np.any((_dev == 0) & (_bins > 1)))
+        if len(np.unique(f2)) == len(f2) and not over_asked and not near_tie and not zero_spread:  # no (near-)ties: selection must match too
             bad |= not np.array_equal(hv, df2["highly_variable"].to_numpy(dtype=bool))
         trigger_if(bad, "SC-HVG-003")
 

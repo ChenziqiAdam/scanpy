@@ -153,7 +153,7 @@
       "id": "SC-HVG-003",
       "invariant": "The result with that batch_key equals the result with batch_key=None.",
       "observation_point": "After the per-gene table is assembled; the unbatched computation is re-run on the same AnnData.",
-      "precondition": "flavor seurat or cell_ranger; batch_key has exactly one populated category; every gene expressed in at least one cell. Genes within a bin are separated from the bin centre by more than the rounding of the dispersion. The reference is computed on the cells with a non-missing batch label (the cells the batched selection uses), and needs at least two of them.",
+      "precondition": "flavor seurat or cell_ranger; batch_key has exactly one populated category; every gene expressed in at least one cell. Genes within a bin are separated from the bin centre by more than the rounding of the dispersion. The reference is computed on the cells with a non-missing batch label (the cells the batched selection uses), and needs at least two of them. The selection comparison applies only when no bin of two or more genes has zero dispersion spread.",
       "rationale": "Batch-wise selection over a single batch must be the plain selection.",
       "scientific_quantity": "batch-aware gene selection",
       "source": "src/scanpy/preprocessing/_highly_variable_genes.py",
