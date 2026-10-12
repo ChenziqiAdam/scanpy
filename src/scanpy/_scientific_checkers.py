@@ -882,6 +882,8 @@ def _recall_de(slim, groupby, *, groups, reference, method, corr_method, tie_cor
 def check_rank_genes_groups(adata, key, groupby, *, reference, method, use_raw, layer, mask_var,
                             corr_method, tie_correct, mean_in_log_space):
     """SC-DE-001 .. SC-DE-005."""
+    import pandas as pd
+
     if method not in {"t-test", "t-test_overestim_var", "wilcoxon"}:
         return
     res = adata.uns[key]
@@ -894,8 +896,13 @@ def check_rank_genes_groups(adata, key, groupby, *, reference, method, use_raw, 
     if not groups:
         return
     n_obs = x.shape[0]
-    slim = _slim(adata, groupby, x, names)
     kw = dict(method=method, corr_method=corr_method, tie_correct=tie_correct, mean_in_log_space=mean_in_log_space)
+    if not pd.Index(names).is_unique:
+        # results are keyed by var name: with repeated names a name no longer identifies a column.
+        # Compare positionally instead: relabel columns and recompute the baseline on the relabelled data.
+        names = pd.Index([f"__v{i}" for i in range(len(names))])
+        res = _recall_de(_slim(adata, groupby, x, names), groupby, groups=groups, reference=reference, **kw)
+    slim = _slim(adata, groupby, x, names)
     eps32 = float(np.finfo(np.float32).eps)
     have_lfc = "logfoldchanges" in res
     sizes = obs.value_counts()
@@ -1002,7 +1009,7 @@ def check_rank_genes_groups(adata, key, groupby, *, reference, method, use_raw, 
     # data when mean_in_log_space=False, which is not odd, so only wilcoxon is in the domain there)
     # (negating unsigned integers wraps around, so those inputs are outside the law's domain)
     if _dtype_kind(x) != "u" and (method == "wilcoxon" or (method == "t-test" and mean_in_log_space)):
-        neg = _slim(adata, groupby, x, names, negate=True)
+        neg = _slim(adata, groupby, x, names, negate=True)  # (uses the relabelled names, if any)
         for g in groups:
             ref_g = reference
             r2 = _recall_de(neg, groupby, groups=[g], reference=ref_g, **kw)
