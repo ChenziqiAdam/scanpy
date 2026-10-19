@@ -52,7 +52,7 @@
       "symbol": "normalize_total"
     },
     {
-      "alarm": "|var - 1| > 2*64*eps*(1+mean_in^2/var_in)*(log2(n_obs)+2) or (zero_center) |mean| > 64*eps*(1+mean_in^2/var_in)*(log2(n_obs)+2), computed in float64 from the produced values (the library variance is a one-pass sum of squares, error ~ eps*(1+mean^2/var)).",
+      "alarm": "|var - 1| > 2*64*eps*(1+mean_in^2/var_in)*(log2(n_obs+2)+n_obs/32) or (zero_center) |mean| > 64*eps*(1+mean_in^2/var_in)*(log2(n_obs+2)+n_obs/32), computed in float64 from the produced values (the library variance is a one-pass sum of squares accumulated recursively over n_obs cells, error up to ~eps*n_obs*(1+mean^2/var)).",
       "family": "standardisation_moments",
       "id": "SC-SCL-001",
       "invariant": "Scaled genes have sample variance (ddof=1) 1 over the observations used for the statistics, and mean 0 when zero_center=True.",
@@ -76,7 +76,7 @@
       "symbol": "scale"
     },
     {
-      "alarm": "any outside-mask entry changed or max |inside - scale(subset, same container)| > 64*eps*(1+mean^2/var)*(log2(n)+2)*max(1,max|scale(subset)|).",
+      "alarm": "any outside-mask entry changed or max |inside - scale(subset, same container; CSR for sparse input with zero_center=False, as the masked path converts CSC to CSR)| > 64*eps*(1+mean^2/var)*(log2(n+2)+n/32)*max(1,max|scale(subset)|) (n = masked cells, recursive accumulation).",
       "family": "masked_scaling_locality",
       "id": "SC-SCL-003",
       "invariant": "Observations outside the mask are unchanged; observations inside equal the unmasked scaling of the masked subset alone.",
@@ -124,7 +124,7 @@
       "symbol": "regress_out"
     },
     {
-      "alarm": "|mean(z)| or |std(z) - 1| > 64*eps*(1+|avg|/dev)*(log2(m)+2) for a bin of m genes.",
+      "alarm": "|mean(z)| or |std(z) - 1| > 64*eps*(1+|avg|/dev)*(log2(m+2)+m/32) for a bin of m genes (the library's bin mean/std is a streaming groupby reduction).",
       "family": "seurat_bin_zscore",
       "id": "SC-HVG-001",
       "invariant": "Within each mean bin the normalised dispersions have mean 0 and sample std (ddof=1) 1.",
@@ -148,7 +148,7 @@
       "symbol": "_highly_variable_genes_single_batch"
     },
     {
-      "alarm": "means/dispersions/normalised dispersions differ by more than 64*eps*(1+|v|)*(log2(n_vars)+2) (for dispersions and normalised dispersions additionally multiplied by the gene's one-pass-variance conditioning 1+mean^2/var, computed on the values the flavor uses) (for normalised dispersions |v| is replaced by |v|+(|disp|+|bin centre|)/bin spread*(2+|v|)), different NaN pattern, or the highly_variable mask differs when no two finite normalised dispersions tie and the n-th and (n+1)-th scores differ by more than that tolerance and n_top_genes does not exceed the number of scored (non-NaN) genes.",
+      "alarm": "means/dispersions/normalised dispersions differ by more than 64*eps*(1+|v|)*(log2(L+2)+L/32) with L = max(n_obs, n_vars) (recursive accumulation over cells, bin statistics over genes) (for dispersions and normalised dispersions additionally multiplied by the gene's one-pass-variance conditioning 1+mean^2/var, computed on the values the flavor uses) (for normalised dispersions |v| is replaced by |v|+(|disp|+|bin centre|)/bin spread*(2+|v|)), different NaN pattern, or the highly_variable mask differs when no two finite normalised dispersions tie and the n-th and (n+1)-th scores differ by more than that tolerance and n_top_genes does not exceed the number of scored (non-NaN) genes.",
       "family": "hvg_single_batch_identity",
       "id": "SC-HVG-003",
       "invariant": "The result with that batch_key equals the result with batch_key=None.",
@@ -268,7 +268,7 @@
       "symbol": "rank_genes_groups"
     },
     {
-      "alarm": "scores or log fold changes differ by > 64*eps*(eps32 + eps64*n_obs*kappa)*(1+|v|) with kappa = 1 + max_gene mean^2/var of the statistics' space (expm1 of the data when mean_in_log_space=False). Log fold changes are compared with an additional allowance for the rest-group mean (computed by subtraction): 64*eps*log2(n_obs)*sum|x|/n_rest/(ln2*(|m_rest|+1e-9)); genes where this allowance is >= 0.5 are not judged.",
+      "alarm": "scores or log fold changes differ by > 64*eps*(eps32 + eps64*n_obs*kappa)*(1+|v|) with kappa = 1 + max_gene mean^2/var of the statistics' space (expm1 of the data when mean_in_log_space=False). Log fold changes are compared with an additional allowance for the rest-group mean (computed by subtraction): 64*eps*(log2(n_obs+2)+n_obs/32)*sum|x|/n_rest/(ln2*(|m_rest|+1e-9)); genes where this allowance is >= 0.5 are not judged.",
       "family": "de_rest_vs_reference",
       "id": "SC-DE-002",
       "invariant": "Comparing a group to 'rest' and to the other group are the same comparison.",
@@ -297,7 +297,7 @@
       "id": "SC-DE-004",
       "invariant": "sign(lfc) = sign(mean_group - mean_reference), with means taken in the space the function documents (mean of the data when mean_in_log_space=True, mean of expm1(data) when False); expm1 and the pseudocount are monotone.",
       "observation_point": "At return of rank_genes_groups; means computed from the same data matrix. Genes are matched by column position; when var names are not unique the comparison is made on position-labelled copies.",
-      "precondition": "t-test, t-test_overestim_var or wilcoxon; non-negative expression data; finite logfoldchanges; mean difference larger than 64*max(eps_x,eps64)*(|m_g|+|m_r|+1e-9)*log2(n) + 1e-8*(|m_g|+|m_r|). Sparse input is in canonical format (no repeated (row, column) entries).",
+      "precondition": "t-test, t-test_overestim_var or wilcoxon; non-negative expression data; finite logfoldchanges; mean difference larger than 64*max(eps_x,eps64)*(|m_g|+|m_r|+1e-9)*(log2(n_obs+2)+n_obs/32) + 1e-8*(|m_g|+|m_r|). Sparse input is in canonical format (no repeated (row, column) entries).",
       "rationale": "The direction of a fold change must follow the direction of the expression difference.",
       "scientific_quantity": "log fold change",
       "source": "src/scanpy/tools/_rank_genes_groups.py",
@@ -316,7 +316,7 @@
       "symbol": "rank_genes_groups"
     },
     {
-      "alarm": "mean difference > 64*eps*max(eps_x,eps64)*(sum_g n_g|m_g|/n_rest+|m|)*(log2(n)+2) or variance difference > 64*eps*max(eps_x,eps64)*n*(1+m^2/v)*v.",
+      "alarm": "mean difference > 64*eps*max(eps_x,eps64)*(sum_g n_g|m_g|/n_rest+|m|)*(log2(n+2)+n/32) or variance difference > 64*eps*max(eps_x,eps64)*n*(1+m^2/v)*v.",
       "family": "de_rest_statistics",
       "id": "SC-DE-006",
       "invariant": "means_rest and vars_rest of group g equal the mean and sample variance (ddof=1) of the observations outside g (up to 4 groups checked).",
@@ -345,7 +345,7 @@
       "id": "SC-SG-002",
       "invariant": "Adding a constant to all expression values leaves the score unchanged (a difference of means; control bins use ranks).",
       "observation_point": "At return of score_genes; re-called on float64 data and on the same data shifted by c.",
-      "precondition": "Finite data; shift c = power of two above max|X|; any two genes whose means agree within 1e3*eps*(c+max|X|) have identical columns (no rank collision). As SC-SG-001, and the shifted copy stays within the float64 range.",
+      "precondition": "Finite data; shift c = power of two above max|X|; any two genes whose means agree within max(1e3, 64*log2(n_obs+2)+2*n_obs)*eps*(c+max|X|) (rounding of the n_obs-term gene means of the shifted copy) have identical columns (no rank collision). As SC-SG-001, and the shifted copy stays within the float64 range.",
       "rationale": "A score contrasts a signature with matched controls, so a global offset cancels.",
       "scientific_quantity": "gene-set score",
       "source": "src/scanpy/tools/_score_genes.py",
@@ -369,7 +369,7 @@
       "id": "SC-NBR-001",
       "invariant": "The connectivity matrix equals its transpose and its finite entries lie in [0,1].",
       "observation_point": "After connectivities are computed.",
-      "precondition": "Any method (gauss with float64 distances that are symmetric up to rounding on mutually stored pairs, umap, jaccard); non-finite weights (e.g. a zero local scale at duplicate points) are not judged.",
+      "precondition": "Any method (gauss with 64-bit distances (float64, or integer whose largest square does not exceed the dtype maximum; gauss squares in the input dtype, so larger integer distances wrap) that are symmetric up to rounding on mutually stored pairs, umap, jaccard); non-finite weights (e.g. a zero local scale at duplicate points) are not judged.",
       "rationale": "Connectivities of an undirected neighbour graph are symmetric weights.",
       "scientific_quantity": "kNN connectivities",
       "source": "src/scanpy/neighbors/__init__.py",
@@ -424,7 +424,7 @@
       "symbol": "pca"
     },
     {
-      "alarm": "max |variance_ratio - variance/total| > 64*eps*eps*(n_vars+n_obs)*(1+max mean^2/var).",
+      "alarm": "max |variance_ratio - variance/total| > 64*eps*(n_vars*variance_1/total + kappa_tot*(log2(n_obs+2)+n_obs/32+log2(n_vars+2))) with kappa_tot = 1+sum_g mean_g^2/total (per-gene variances accumulate recursively over n_obs cells).",
       "family": "pca_variance_ratio",
       "id": "SC-PCA-002",
       "invariant": "variance_ratio_k = variance_k / sum_g Var(X_g) with the total from fast_array_utils.stats.mean_var.",

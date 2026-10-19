@@ -229,6 +229,16 @@ def _log2(n):
     return math.log2(max(int(n), 1) + 2)
 
 
+def _seq(n):
+    """Size factor for an n-term reduction done by the library (multiplies ``_C * eps``).
+
+    ``_log2(n)`` is the pairwise-summation bound; numpy axis-0 reductions, the fast_array_utils / numba
+    kernels and pandas groupby accumulate recursively or streaming, whose worst case is (n-1)u (one dominant
+    term absorbs the rest). ``_log2(n) + 2n/_C`` adds 2*eps*n = 4u*n to the pairwise term.
+    """
+    return _log2(n) + 2.0 * max(int(n), 1) / _C
+
+
 def snap_array(x):
     """Copy of a dense or sparse (non-dask, non-backed) matrix, else ``None``."""
     try:
@@ -416,8 +426,8 @@ def check_scale(snap, out, *, zero_center, max_value, mask):
     ok &= (std_in**2 >= _tiny_n(_dt_in)) & (np.max(np.abs(a_in), axis=0) ** 2 * n < _range_limit(_dt_in))
     # SC-SCL-001 (law needs unclipped output)
     if max_value is None and ok.any():
-        # the variance comes from a one-pass sum-of-squares mean_var: error ~ eps*(1 + mean^2/var)
-        kappa = (1.0 + (mean_in[ok] / std_in[ok]) ** 2) * _log2(n)
+        # the variance comes from a one-pass sum-of-squares mean_var over n cells: error ~ eps*n*(1 + mean^2/var)
+        kappa = (1.0 + (mean_in[ok] / std_in[ok]) ** 2) * _seq(n)
         tol = _C * eps * kappa
         bad = np.max(np.abs(a_out[:, ok].var(axis=0, ddof=1) - 1.0) - 2 * tol)
         if zero_center:
@@ -448,12 +458,14 @@ def check_scale(snap, out, *, zero_center, max_value, mask):
         outside = full_in[~rows]
         changed = not np.array_equal(full_out[~rows], outside, equal_nan=True)
         sub = snap[rows]  # same container as the call under test (csc and csr accumulate differently)
+        if _is_sparse(sub) and sub.format == "csc" and not zero_center:
+            sub = sub.tocsr()  # the masked sparse path (zero_center=False) converts CSC to CSR before mean_var
         s = _dense64(run(sub.copy(), max_value, None))
         # a numerically constant gene has a rounding-noise std, so its scaled values are ill-conditioned
         well = std_in > 1e-6 * np.abs(mean_in)
         d = float(np.max(np.abs(s[:, well] - a_out[:, well]))) if s.size and well.any() else 0.0
-        # the one-pass variance of either computation carries error ~ eps * (1 + mean^2/var)
-        kappa = float(np.max((1.0 + (mean_in[well] / std_in[well]) ** 2) * _log2(n))) if well.any() else 1.0
+        # the one-pass variance of either computation over n cells carries error ~ eps * n * (1 + mean^2/var)
+        kappa = float(np.max((1.0 + (mean_in[well] / std_in[well]) ** 2) * _seq(n))) if well.any() else 1.0
         trigger_if(changed or _violates(d, _C * eps * kappa * max(1.0, float(np.max(np.abs(s[:, well]))) if s.size and well.any() else 1.0)), "SC-SCL-003")
 
 
@@ -569,7 +581,8 @@ def check_hvg_binned(df, flavor):
             avg, dev = float(dv.mean()), float(dv.std(ddof=1))
             if not dev > 0:
                 continue
-            tol = _C * _EPS * (1.0 + abs(avg) / dev) * _log2(m)
+            # production's bin mean/std is a pandas groupby (streaming) reduction over the bin's m genes
+            tol = _C * _EPS * (1.0 + abs(avg) / dev) * _seq(m)
             bad |= _violates(abs(float(zv.mean())), tol) or _violates(abs(float(zv.std(ddof=1)) - 1.0), tol)
         elif flavor == "cell_ranger":
             avg, dev = float(np.median(dv)), float(mad(dv))
@@ -664,6 +677,9 @@ def check_hvg_selection(adata, df, *, batch_key, layer, cutoff, n_bins, flavor, 
         _kv = np.where(np.isfinite(_kv), _kv, 1.0)
         # ``x`` is in adata.var order; df (and df2, reindexed to it) may be ordered differently
         _kv_df = pd.Series(_kv, index=adata.var_names).reindex(df.index).fillna(1.0).to_numpy(dtype=np.float64)
+        # means/dispersions accumulate over the n_obs cells (order depends on memory layout), the bin statistics
+        # behind dispersions_norm over up to n_vars genes: the longer accumulation sets the size factor
+        _len = _seq(max(int(x.shape[0]), len(df)))
         for col in ("means", "dispersions", "dispersions_norm"):
             a = df[col].to_numpy(dtype=np.float64)
             b = df2[col].to_numpy(dtype=np.float64)
@@ -673,7 +689,7 @@ def check_hvg_selection(adata, df, *, batch_key, layer, cutoff, n_bins, flavor, 
             f = np.isfinite(a) & np.isfinite(b)
             kv = _kv_df[f] if col != "means" else 1.0
             amp = (_cond[f] * (2.0 + np.abs(a[f]))) if col == "dispersions_norm" else 0.0
-            diff = np.abs(a[f] - b[f]) - _C * _EPS * (1.0 + np.abs(a[f]) + amp) * kv * _log2(len(a))
+            diff = np.abs(a[f] - b[f]) - _C * _EPS * (1.0 + np.abs(a[f]) + amp) * kv * _len
             bad |= (not same_nan) or bool(np.any(diff > 0))
         n2 = df2["dispersions_norm"].to_numpy(dtype=np.float64)
         f2 = n2[np.isfinite(n2)]
@@ -687,7 +703,7 @@ def check_hvg_selection(adata, df, *, batch_key, layer, cutoff, n_bins, flavor, 
         near_tie = False
         if isinstance(cutoff, (int, np.integer)) and not isinstance(cutoff, bool) and 0 < int(cutoff) < f2.size:
             fin2 = np.isfinite(n2)
-            tol_n = _C * _EPS * (1.0 + np.abs(n2[fin2]) + _cond[fin2] * (2.0 + np.abs(n2[fin2]))) * _kv_df[fin2] * _log2(len(n2))
+            tol_n = _C * _EPS * (1.0 + np.abs(n2[fin2]) + _cond[fin2] * (2.0 + np.abs(n2[fin2]))) * _kv_df[fin2] * _len
             order = np.argsort(-n2[fin2])
             k = int(cutoff)
             near_tie = bool(n2[fin2][order[k - 1]] - n2[fin2][order[k]] <= tol_n[order[k - 1]] + tol_n[order[k]])
@@ -968,7 +984,7 @@ def check_rank_genes_groups(adata, key, groupby, *, reference, method, use_raw, 
             # means_rest = (sum_h n_h m_h - n_g m_g) / n_rest: absolute error ~ eps * sum_h n_h |m_h| / n_rest
             gm = (obs == cats[g]).to_numpy()
             m_rest = xs[~gm].mean(axis=0)
-            d_rest = _C * _EPS * _log2(n_obs) * np.abs(xs).sum(axis=0) / max(int((~gm).sum()), 1)
+            d_rest = _C * _EPS * _seq(n_obs) * np.abs(xs).sum(axis=0) / max(int((~gm).sum()), 1)
             lfc_tol = d_rest / ((np.abs(m_rest) + 1e-9) * math.log(2.0))
             idx_n = {nm: i for i, nm in enumerate(names.tolist())}
             for fld in ("scores", "logfoldchanges") if have_lfc else ("scores",):
@@ -1011,7 +1027,7 @@ def check_rank_genes_groups(adata, key, groupby, *, reference, method, use_raw, 
                     continue
                 dm = mg[i] - mr[i]
                 # lfc = log2((mg+1e-9)/(mr+1e-9)): a mean difference below rounding of the pseudocounted means is unresolvable
-                tol = _C * max(eps_x, _EPS) * (abs(mg[i]) + abs(mr[i]) + 1e-9) * _log2(n_obs) + 1e-8 * (abs(mg[i]) + abs(mr[i]))
+                tol = _C * max(eps_x, _EPS) * (abs(mg[i]) + abs(mr[i]) + 1e-9) * _seq(n_obs) + 1e-8 * (abs(mg[i]) + abs(mr[i]))
                 if abs(dm) > tol and v != 0:
                     bad["004"] |= (np.sign(v) != np.sign(dm))
                 elif abs(dm) > tol and v == 0:
@@ -1067,7 +1083,7 @@ def check_rest_stats(rg, x):
         m, v = stats.mean_var(xr, axis=0, correction=1)
         m, v = np.asarray(m, dtype=np.float64), np.asarray(v, dtype=np.float64)
         scale = sum(sel_counts[h] * mean_abs[h] for h in range(k)) / n_rest + np.abs(m)
-        tol_m = _C * max(eps, _EPS) * (scale + 1e-300) * _log2(n)
+        tol_m = _C * max(eps, _EPS) * (scale + 1e-300) * _seq(n)  # n-term recursive sums
         bad |= bool(np.any(np.abs(np.asarray(rg.means_rest[g]) - m) > tol_m))
         if rg.vars_rest is not None:
             kappa = 1.0 + m**2 / np.maximum(v, 1e-300)
@@ -1129,7 +1145,9 @@ def check_score_genes(adata, gene_list, rng0, *, ctrl_as_ref, ctrl_size, gene_po
     order = np.argsort(mu, kind="stable")
     _, cid = np.unique(xd, axis=1, return_inverse=True)
     cid = np.asarray(cid).ravel()
-    near = np.diff(mu[order]) <= 1e3 * _EPS * (shift + scale)
+    # production's gene means of the shifted copy are n_obs-term axis-0 sums of values up to shift+scale:
+    # two means closer than that accumulation error may swap rank (the earlier 1e3*eps floor is kept for small n_obs)
+    near = np.diff(mu[order]) <= max(1e3, _C * _seq(xd.shape[0])) * _EPS * (shift + scale)
     if np.any(near & (cid[order][1:] != cid[order][:-1])):
         return
     if (scale + shift) * len(names) >= _range_limit(np.float64):  # shifted copy leaves the dtype range
@@ -1158,6 +1176,12 @@ def check_connectivities(w, method, distances=None):
     # unbounded (width-dependent) factor, so that leg is judged for float64 distances only
     if method == "gauss" and distances is not None and np.dtype(distances.dtype).itemsize < 8:
         return
+    # gauss squares the distances in their own dtype: integer distances whose square passes the dtype range
+    # wrap around (integer overflow, traditional-bank territory), so they are outside the law's domain
+    if method == "gauss" and distances is not None and np.dtype(distances.dtype).kind in "iu":
+        _dm = _max_abs(distances)  # element-wise square, no accumulation: the exact integer bound applies
+        if not math.isfinite(_dm) or int(_dm) ** 2 > int(np.iinfo(distances.dtype).max):
+            return
     # the gaussian kernel is symmetric only for symmetric input dissimilarities (kNN graphs are directed by
     # construction, so only mutually stored pairs are compared)
     if method == "gauss" and distances is not None:
@@ -1338,6 +1362,7 @@ def check_pca(x, x_pca, pca_, zero_center, svd_solver, chunked):
         bad1 |= _violates(float(np.max(np.abs(s.mean(axis=0)))), _C * eps * n_obs * kappa_tot * math.sqrt(float(ev[0])) + 1e-300)
     trigger_if(bad1, "SC-PCA-001")
     # absolute error on a ratio: eigenvalue error eps*n_vars*lambda_1 relative to the total, plus the
-    # error of the total itself, eps*log2(n)*kappa_tot (per-gene errors scale with v_g + m_g^2)
-    tol = _C * eps * (n_vars * float(ev[0]) / total + kappa_tot * _log2(n_obs * n_vars))
+    # error of the total itself: per-gene variances accumulate over n_obs cells (eps*n_obs*(v_g + m_g^2)),
+    # then are summed over n_vars genes
+    tol = _C * eps * (n_vars * float(ev[0]) / total + kappa_tot * (_seq(n_obs) + _log2(n_vars)))
     trigger_if(_violates(float(np.max(np.abs(evr - ev / total))), tol), "SC-PCA-002")
