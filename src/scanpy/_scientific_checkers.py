@@ -823,6 +823,13 @@ def check_autocorr(metric, result):
         bad2 |= in_range and _violates(abs(aff - base), _C * _EPS * kap2 * lg * (1.0 + abs(base)))
         # SC-AUT-003: representation consistency
         tol3 = _C * max(_EPS, eps_v) * n * (1.0 + (mean / std) ** 2) * (1.0 + abs(r0))
+        # Geary's CSR kernel forms the uncentred expansion 2W*(sum x^2 - 2*xbar*sum x + n*xbar^2) in the
+        # input dtype, bounded by 8*n*max|x|^2*W: it must stay in range, else the CSR copy overflows where the
+        # centred dense/vector kernels do not (float overflow, not a representation inconsistency)
+        _vmax = float(np.max(np.abs(v64)))
+        _lim3 = min(_range_limit(np.float64), _range_limit(v.dtype) or np.inf)
+        if not 8.0 * _vmax**2 * n * _wsum1 < _lim3:
+            continue
         with _quiet():
             r_d = float(np.atleast_1d(cls(graph, v[None, :])())[0])
             r_s = float(np.atleast_1d(cls(graph, sparse.csr_matrix(v[None, :]))())[0])

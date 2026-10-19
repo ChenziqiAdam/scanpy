@@ -249,7 +249,7 @@
       "id": "SC-AUT-003",
       "invariant": "Vector, dense-matrix row and CSR-matrix row of the same values give the same statistic.",
       "observation_point": "After the statistic is computed; re-called through dense and CSR 2-D representations.",
-      "precondition": "As SC-AUT-001. Features whose sum of squared deviations is below finfo(float64).tiny/eps are not judged.",
+      "precondition": "Square non-negative finite graph, finite values with positive variance. Sparse input is in canonical format (no repeated (row, column) entries). Features whose sum of squared deviations is below finfo(float64).tiny/eps are not judged. The uncentred sparse-kernel expansion stays within the value dtype's range (8*max|x|^2*n*max(1,sum of weights) below finfo(dtype).max/2, dtype at most float64).",
       "rationale": "The result must not depend on the container of the values.",
       "scientific_quantity": "Moran's I / Geary's C",
       "source": "src/scanpy/metrics/_common.py",
