@@ -239,12 +239,41 @@ def _seq(n):
     return _log2(n) + 2.0 * max(int(n), 1) / _C
 
 
+def _self_overlapping(x):
+    """True when two logical entries of ndarray ``x`` share memory (e.g. ``sliding_window_view``,
+    ``broadcast_to``, zero or sub-itemsize strides).
+
+    The hooked routines (normalize_total, scale, regress_out, downsample_counts) write in place, so on
+    such an array one write silently rewrites other entries and the result is undefined (NumPy documents
+    writeable stride-trick views as unsafe to write); the laws are not judged for it. Fast sufficient
+    test: strides sorted by magnitude each clear the span of the smaller dims; otherwise exact test on
+    the sorted byte offsets of all entries (no false positives for exotic non-overlapping layouts).
+    """
+    dims = sorted((abs(s), n) for s, n in zip(x.strides, x.shape) if n > 1)
+    span = x.itemsize
+    for s, n in dims:
+        if s < span:
+            break
+        span = s * n
+    else:
+        return False
+    off = np.zeros(1, dtype=np.int64)
+    for s, n in dims:
+        off = (off[:, None] + s * np.arange(n, dtype=np.int64)[None, :]).ravel()
+    return bool(np.any(np.diff(np.sort(off)) < x.itemsize))
+
+
 def snap_array(x):
-    """Copy of a dense or sparse (non-dask, non-backed) matrix, else ``None``."""
+    """Copy of a dense or sparse (non-dask, non-backed) matrix, else ``None``.
+
+    ``None`` also for a self-overlapping ndarray (``_self_overlapping``): in-place writes alias.
+    """
     try:
         if _is_sparse(x):
             return x.copy()
         if isinstance(x, np.ndarray) and x.dtype.kind in "fiu":
+            if x.size > 1 and _self_overlapping(x):
+                return None
             return x.copy()
     except Exception:
         _swallowed()
