@@ -944,6 +944,8 @@ def check_rank_genes_groups(adata, key, groupby, *, reference, method, use_raw, 
     # SC-DE-001 / 003: swap groups against an explicit reference
     if reference != "rest" and method != "t-test_overestim_var":
         for g in groups:
+            if g == "rest":  # round 16: reference="rest" is the 'all other cells' keyword, so the swap is not expressible
+                continue
             r2 = _recall_de(slim, groupby, groups=[reference], reference=g, **kw)
             if reference not in r2["scores"].dtype.names:
                 continue
