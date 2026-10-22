@@ -1217,14 +1217,18 @@ def check_connectivities(w, method, distances=None):
     # construction, so only mutually stored pairs are compared)
     if method == "gauss" and distances is not None:
         _d = distances.tocsr() if _is_sparse(distances) else np.asarray(distances, dtype=np.float64)
+        # entry-wise: each mutually stored pair's asymmetry is judged against that pair's own magnitude (a far
+        # outlier point must not inflate the scale and admit asymmetric input, which the kernel propagates)
         if _is_sparse(_d):
             _m = (_d != 0).multiply(_d.T != 0)
-            _asym = abs(_d.multiply(_m) - _d.T.multiply(_m)).max() if _m.nnz else 0.0
-            _dmax = abs(_d).max() if _d.nnz else 0.0
+            _a = _d.multiply(_m).tocoo()
+            _b = np.asarray(_d.T.multiply(_m).tocsr()[_a.row, _a.col]).ravel()
+            _tol = _C * _eps_of(distances) * np.maximum(np.abs(_a.data), np.abs(_b))
+            _asym_ok = bool(np.all(np.abs(_a.data - _b) <= _tol))  # NaN is not provably small
         else:
-            _asym = np.max(np.abs(_d - _d.T)) if _d.size else 0.0
-            _dmax = np.max(np.abs(_d)) if _d.size else 0.0
-        if not float(_asym) <= _C * _eps_of(distances) * max(float(_dmax), 1e-300):
+            _tol = _C * _eps_of(distances) * np.maximum(np.abs(_d), np.abs(_d.T))
+            _asym_ok = bool(np.all(np.abs(_d - _d.T) <= _tol)) if _d.size else True
+        if not _asym_ok:
             return
     eps = _eps_of(w)
     # non-finite weights (e.g. a zero local scale at duplicate points) are not judged here
