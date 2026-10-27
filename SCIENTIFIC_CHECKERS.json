@@ -112,7 +112,7 @@
       "symbol": "downsample_counts"
     },
     {
-      "alarm": "|D_k . r_j| / (||D_k|| ||y_j||) > 64*eps*cond(D)^2 (eps of the data dtype; normal-equation error model).",
+      "alarm": "|D_k . r_j| / (||D_k|| ||y_j||) > 64*eps*cond(D)^2*max(1,sqrt(n_obs)) (eps of the data dtype; normal-equation error model, n-term inner-product rounding).",
       "family": "regress_out_residual_decorrelation",
       "id": "SC-RGO-001",
       "invariant": "Each gene's residual is orthogonal to every column of D (linear dependence removed, residual mean 0).",

@@ -582,7 +582,9 @@ def check_regress_out(snap, res, regressors, categorical):
     sc_ = np.max(np.abs(y[:, nonconst]), axis=0)
     yn = np.linalg.norm(y[:, nonconst] / sc_, axis=0)
     inner = np.abs(d.T @ (r[:, nonconst] / sc_)) / (dn[:, None] * yn[None, :])
-    trigger_if(_violates(float(np.max(inner)), _C * eps * cond**2), "SC-RGO-001")
+    # round 24: the coefficients come from n-term inner products D^T y, whose rounding grows ~sqrt(n) eps
+    # (LAPACK lstsq itself reaches ~1.3 sqrt(n) eps on cond(D)=1 designs), so the tolerance scales with sqrt(n_obs)
+    trigger_if(_violates(float(np.max(inner)), _C * eps * cond**2 * max(1.0, float(np.sqrt(d.shape[0])))), "SC-RGO-001")
 
 
 # ================================================== E. highly variable genes
